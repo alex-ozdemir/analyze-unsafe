@@ -1,0 +1,8 @@
+target
+index
+sources
+crates.io-index
+*.swp
+*.out
+*.err
+*.txt
