@@ -5,9 +5,9 @@ authors = ["Alex Ozdemir <aozdemir@hmc.edu>"]
 
 [dependencies]
 cargo = "0"
-#getopts = "0"
 glob = "0"
 rustc-serialize = "0"
+libc = "0"
 
 [[bin]]
 name = "analyze"
