@@ -1,5 +1,6 @@
 #!/bin/zsh
-path_to_bin=../../target/debug/analyze
+script_dir=${0%/*}
+path_to_bin="$script_dir/../../target/debug/analyze"
 for line in $(cargo read-manifest |
     jq '{name: .name, target: .targets | .[] | select(.kind != ["test"]) | {name: .name, src_path: .src_path, kind: .kind| .[0]}}' |
     jq '.name + " " + .target.name + " " + .target.kind + " " + .target.src_path' |

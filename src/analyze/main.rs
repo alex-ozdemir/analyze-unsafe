@@ -12,6 +12,12 @@ use syntax::visit;
 use rustc::session::Session;
 use rustc_driver::{driver, CompilerCalls, Compilation};
 
+mod other_mod;
+
+extern "cdecl" {
+    fn myfn(i: i64) -> i64;
+}
+
 fn count_unsafe(krate: &ast::Crate) -> UnsafeData {
     let mut v = UnsafeVisitor::new();
     visit::walk_crate(&mut v, krate);
@@ -31,6 +37,7 @@ struct UnsafeData {
     functions: Counts,
     methods: Counts,
     impls: Counts,
+    has_ffi: bool,
 }
 
 impl UnsafeData {
@@ -40,6 +47,7 @@ impl UnsafeData {
             functions: Counts::new(),
             methods: Counts::new(),
             impls: Counts::new(),
+            has_ffi: false,
         }
     }
 }
@@ -75,6 +83,9 @@ impl<'v> visit::Visitor<'v> for UnsafeVisitor {
                 self.data.impls.unsaf += 1;
             }
             self.data.impls.total += 1;
+        }
+        if let ast::ItemKind::ForeignMod(_) = i.node {
+            self.data.has_ffi = true;
         }
         visit::walk_item(self, i)
     }
@@ -127,16 +138,18 @@ impl<'a> CompilerCalls<'a> for AnalyzeUnsafe {
                 blocks,
                 functions,
                 methods,
-                impls
+                impls,
+                has_ffi
             } = count_unsafe(state.krate.as_ref().unwrap());
-            println!("{} {} {} {}/{} {}/{} {}/{} {}/{}",
+            println!("{} {} {} {}/{} {}/{} {}/{} {}/{} {}",
                      crate_name,
                      target_name,
                      target_type,
                      blocks.unsaf, blocks.total,
                      functions.unsaf, functions.total,
                      methods.unsaf, methods.total,
-                     impls.unsaf, impls.total);
+                     impls.unsaf, impls.total,
+                     has_ffi);
         });
         control.after_parse.stop = Compilation::Stop;
 
