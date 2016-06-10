@@ -1,18 +1,28 @@
+#![feature(rustc_private)]
 // Alex Ozdemir <aozdemir@hmc.edu>
 // Tool for counting unsafe invocations in an AST
-#![feature(rustc_private)]
 
 extern crate getopts;
 extern crate syntax;
 extern crate rustc;
 extern crate rustc_driver;
 
-use syntax::{abi,ast,visit};
+use std::path::PathBuf;
+use syntax::{abi,ast,diagnostics,visit};
 //use rustc::hir;
 //use rustc::hir::intravisit as hir_visit;
 use rustc::ty;
-use rustc::session::Session;
-use rustc_driver::{driver, CompilerCalls, Compilation};
+use rustc::session::{config,Session};
+use rustc_driver::{driver,CompilerCalls,RustcDefaultCalls,Compilation};
+
+use std::io::Write;
+
+macro_rules! errln(
+    ($($arg:tt)*) => { {
+        let r = writeln!(&mut ::std::io::stderr(), $($arg)*);
+        r.expect("failed printing to stderr");
+    } }
+);
 
 fn count_unsafe<'a,'tcx>(krate: &ast::Crate, tcx: ty::TyCtxt<'a,'tcx,'tcx>) -> UnsafeData {
     let mut v = UnsafeVisitor::new(tcx);
@@ -159,48 +169,94 @@ impl<'v, 'b, 'tcx> visit::Visitor<'v> for UnsafeVisitor<'b,'tcx> {
     }
 }
 
-struct AnalyzeUnsafe;
+struct AnalyzeUnsafe(RustcDefaultCalls,bool);
 
 impl<'a> CompilerCalls<'a> for AnalyzeUnsafe {
+    fn early_callback(&mut self,
+                      matches: &getopts::Matches,
+                      sopts: &config::Options,
+                      descriptions: &diagnostics::registry::Registry,
+                      output: config::ErrorOutputType)
+                      -> Compilation {
+        self.0.early_callback(matches, sopts, descriptions, output)
+    }
+    fn no_input(&mut self,
+                matches: &getopts::Matches,
+                sopts: &config::Options,
+                odir: &Option<PathBuf>,
+                ofile: &Option<PathBuf>,
+                descriptions: &diagnostics::registry::Registry)
+                -> Option<(config::Input, Option<PathBuf>)> {
+        self.0.no_input(matches, sopts, odir, ofile, descriptions)
+    }
+
+    fn late_callback(&mut self,
+                     matches: &getopts::Matches,
+                     sess: &Session,
+                     input: &config::Input,
+                     odir: &Option<PathBuf>,
+                     ofile: &Option<PathBuf>)
+                     -> Compilation {
+        if let &Some(ref dir) = odir {
+            if let Some(dir_name) = dir.file_name() {
+                if dir_name == "deps" {
+                    self.1 = false;
+                }
+            }
+        }
+        self.0.late_callback(matches, sess, input, odir, ofile)
+    }
     fn build_controller(
         &mut self,
-        _: &Session,
-        _: &getopts::Matches
+        sess: &Session,
+        matches: &getopts::Matches
     ) -> driver::CompileController<'a> {
-        let mut control = driver::CompileController::basic();
-
+        let mut control = self.0.build_controller(sess, matches);
+        let do_analysis = self.1;
+        let original_after_analysis_callback = control.after_analysis.callback;
         control.after_analysis.callback = Box::new(move |state| {
-            if let Some(krate) = state.expanded_crate {
-                let tcx = state.tcx.expect("no type context");
-                let UnsafeData {
-                    unsafe_blocks_no_ffi,
-                    unsafe_blocks_no_unsafe_fn,
-                    blocks,
-                    functions,
-                    methods,
-                    impls,
-                    declares_ffi,
-                } = count_unsafe(krate, tcx);
-                println!("{} {}/{}/{}/{} {}/{} {}/{} {}/{} {}",
-                         state.crate_name.expect("no crate name"),
-                         unsafe_blocks_no_unsafe_fn,
-                         unsafe_blocks_no_ffi,
-                         blocks.unsaf, blocks.total,
-                         functions.unsaf, functions.total,
-                         methods.unsaf, methods.total,
-                         impls.unsaf, impls.total,
-                         declares_ffi
-                         );
+            if do_analysis {
+                if let Some(krate) = state.expanded_crate {
+                    let tcx = state.tcx.expect("no type context");
+                    let UnsafeData {
+                        unsafe_blocks_no_ffi,
+                        unsafe_blocks_no_unsafe_fn,
+                        blocks,
+                        functions,
+                        methods,
+                        impls,
+                        declares_ffi,
+                    } = count_unsafe(krate, tcx);
+                    errln!("ANALYSIS: {} {} {}/{}/{}/{} {}/{} {}/{} {}/{} {}",
+                             state.crate_name.unwrap_or("????"),
+                             state.session.opts.crate_types.iter().next().map(|t| format!("{:?}",t)).unwrap_or("????".to_string()),
+                             unsafe_blocks_no_unsafe_fn,
+                             unsafe_blocks_no_ffi,
+                             blocks.unsaf, blocks.total,
+                             functions.unsaf, functions.total,
+                             methods.unsaf, methods.total,
+                             impls.unsaf, impls.total,
+                             declares_ffi
+                             );
+                }
+                original_after_analysis_callback(state);
             }
         });
-        control.after_analysis.stop = Compilation::Stop;
 
+//        let original_after_parse_callback = control.after_parse.callback;
+//        control.after_parse.callback = Box::new(move |state| {
+//            let mut hi = state;
+//            let mut hi2 = hi.session;
+//            let mut hi3 = hi2.opts;
+//            if save_ast { hi.session.opts.debugging_opts.keep_ast = true; }
+//            original_after_parse_callback(hi);
+//        });
         control
     }
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let mut analyzer = AnalyzeUnsafe;
+    let mut analyzer = AnalyzeUnsafe(RustcDefaultCalls, true);
     rustc_driver::run_compiler(&args, &mut analyzer);
 }

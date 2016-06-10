@@ -1,5 +1,7 @@
 target
 index
+bin
+lib
 sources
 crates.io-index
 *.swp

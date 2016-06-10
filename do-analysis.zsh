@@ -4,7 +4,7 @@ filename=crate-list.txt
 
 if [ ! -z "$1" ]; then filename=$1; fi
 
-echo "crate target_name target_type blocks functions methods impls"
+echo "crate target_type blocks functions methods impls"
 
 for crate_name in $(cat $filename); do
     cd sources
@@ -15,7 +15,8 @@ for crate_name in $(cat $filename); do
     if [[ -a $crate_name ]]; then
         cd "$crate_name"
         #>&2 echo "Running plugin, ../../$PLUGIN , on $crate_name ... "
-        eval "../../$PLUGIN" 2> /dev/null | sed '/^ /d'
+        eval rustup run analyze cargo build
+        eval rustup run analyze cargo clean
         cd ..
     fi
     cd ..
