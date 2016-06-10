@@ -8,9 +8,9 @@ extern crate rustc;
 extern crate rustc_driver;
 
 use std::path::PathBuf;
-use syntax::{abi,ast,diagnostics,visit};
-//use rustc::hir;
-//use rustc::hir::intravisit as hir_visit;
+use syntax::{abi,ast,diagnostics};
+use rustc::hir;
+use rustc::hir::intravisit as visit;
 use rustc::ty;
 use rustc::session::{config,Session};
 use rustc_driver::{driver,CompilerCalls,RustcDefaultCalls,Compilation};
@@ -24,8 +24,8 @@ macro_rules! errln(
     } }
 );
 
-fn count_unsafe<'a,'tcx>(krate: &ast::Crate, tcx: ty::TyCtxt<'a,'tcx,'tcx>) -> UnsafeData {
-    let mut v = UnsafeVisitor::new(tcx);
+fn count_unsafe<'a,'tcx>(krate: &hir::Crate, tcx: ty::TyCtxt<'a,'tcx,'tcx>) -> UnsafeData {
+    let mut v = UnsafeVisitor::new(tcx, krate);
     visit::walk_crate(&mut v, krate);
     v.data
 }
@@ -64,33 +64,39 @@ impl UnsafeData {
 
 unsafe impl Send for UnsafeData {}
 
-struct UnsafeVisitor<'a, 'tcx: 'a> {
+struct UnsafeVisitor<'a, 'tcx: 'a, 'b> {
     data: UnsafeData,
     tcx: ty::TyCtxt<'a, 'tcx, 'tcx>,
+    krate: &'b hir::Crate,
     has_ffi: bool,
     has_unsafe_fn: bool,
 }
 
-impl<'b,'tcx:'b> UnsafeVisitor<'b,'tcx> {
-    fn new(tcx: ty::TyCtxt<'b,'tcx,'tcx>) -> UnsafeVisitor<'b,'tcx> {
+impl<'a,'tcx:'a,'b> UnsafeVisitor<'a,'tcx,'b> {
+    fn new(tcx: ty::TyCtxt<'a,'tcx,'tcx>, krate: &'b hir::Crate) -> UnsafeVisitor<'a,'tcx,'b> {
         UnsafeVisitor {
             data: UnsafeData::new(),
             tcx: tcx,
+            krate: krate,
             has_ffi: false,
             has_unsafe_fn: false,
         }
     }
 }
 
-impl<'v, 'b, 'tcx> visit::Visitor<'v> for UnsafeVisitor<'b,'tcx> {
-    fn visit_block(&mut self, b: &ast::Block) {
-        use syntax::ast::BlockCheckMode::Unsafe;
-        use syntax::ast::UnsafeSource::UserProvided;
+impl<'v, 'a, 'tcx, 'b> visit::Visitor<'v> for UnsafeVisitor<'a,'tcx,'b> {
+    fn visit_nested_item(&mut self, id: hir::ItemId) {
+        let item = self.krate.items.get(&id.id).expect("ItemId should exist");
+        self.visit_item(item);
+    }
+    fn visit_block(&mut self, b: &hir::Block) {
+        use rustc::hir::BlockCheckMode::UnsafeBlock;
+        use rustc::hir::UnsafeSource::UserProvided;
 
         self.data.blocks.total += 1;
 
         let is_unsafe_block = match *b {
-            ast::Block{rules: Unsafe(UserProvided), ..} => true,
+            hir::Block{rules: UnsafeBlock(UserProvided), ..} => true,
             _ => false,
         };
 
@@ -115,9 +121,9 @@ impl<'v, 'b, 'tcx> visit::Visitor<'v> for UnsafeVisitor<'b,'tcx> {
             self.has_unsafe_fn = old_unsafe_fn
         }
     }
-    fn visit_expr(&mut self, expr: &'v ast::Expr) {
+    fn visit_expr(&mut self, expr: &'v hir::Expr) {
         use rustc::hir::Unsafety;
-        if let ast::ExprKind::Call(ref ptr_expr, _) = expr.node {
+        if let hir::Expr_::ExprCall(ref ptr_expr, _) = expr.node {
             let tys = self.tcx.node_id_to_type(ptr_expr.id);
             if let ty::TyFnDef(_, _,
                                &ty::BareFnTy{unsafety, abi, ..}) = tys.sty {
@@ -129,38 +135,38 @@ impl<'v, 'b, 'tcx> visit::Visitor<'v> for UnsafeVisitor<'b,'tcx> {
         };
         visit::walk_expr(self, expr);
     }
-    fn visit_item(&mut self, i: &'v ast::Item) {
-        if let ast::ItemKind::Impl(unsafety,_ ,_ ,_, _, _) = i.node {
-            if unsafety == ast::Unsafety::Unsafe {
+    fn visit_item(&mut self, i: &'v hir::Item) {
+        if let hir::Item_::ItemImpl(unsafety,_ ,_ ,_, _, _) = i.node {
+            if unsafety == hir::Unsafety::Unsafe {
                 self.data.impls.unsaf += 1;
             }
             self.data.impls.total += 1;
         }
-        if let ast::ItemKind::ForeignMod(_) = i.node {
+        if let hir::Item_::ItemForeignMod(_) = i.node {
             self.data.declares_ffi = true;
         }
         visit::walk_item(self, i)
     }
     fn visit_fn(&mut self,
                 fk: visit::FnKind<'v>,
-                fd: &'v ast::FnDecl,
-                b: &'v ast::Block,
+                fd: &'v hir::FnDecl,
+                b: &'v hir::Block,
                 s: syntax::codemap::Span,
                 _: ast::NodeId) {
         match fk {
-            visit::FnKind::ItemFn(_, _, unsafety, _, _, _) => {
-                if let ast::Unsafety::Unsafe = unsafety {
+            visit::FnKind::ItemFn(_, _, unsafety, _, _, _, _) => {
+                if let hir::Unsafety::Unsafe = unsafety {
                     self.data.functions.unsaf += 1;
                 }
                 self.data.functions.total += 1;
             },
-            visit::FnKind::Method(_, &ast::MethodSig{ unsafety, ..}, _) => {
-                if let ast::Unsafety::Unsafe = unsafety {
+            visit::FnKind::Method(_, &hir::MethodSig{ unsafety, ..}, _, _) => {
+                if let hir::Unsafety::Unsafe = unsafety {
                     self.data.methods.unsaf += 1;
                 }
                 self.data.methods.total += 1;
             },
-            visit::FnKind::Closure => {
+            visit::FnKind::Closure(_) => {
                 // Closures cannot be declared unsafe
                 // TODO(aozdemir): There is some interesting work to do here.
             }
@@ -216,29 +222,28 @@ impl<'a> CompilerCalls<'a> for AnalyzeUnsafe {
         let original_after_analysis_callback = control.after_analysis.callback;
         control.after_analysis.callback = Box::new(move |state| {
             if do_analysis {
-                if let Some(krate) = state.expanded_crate {
-                    let tcx = state.tcx.expect("no type context");
-                    let UnsafeData {
-                        unsafe_blocks_no_ffi,
-                        unsafe_blocks_no_unsafe_fn,
-                        blocks,
-                        functions,
-                        methods,
-                        impls,
-                        declares_ffi,
-                    } = count_unsafe(krate, tcx);
-                    errln!("ANALYSIS: {} {} {}/{}/{}/{} {}/{} {}/{} {}/{} {}",
-                             state.crate_name.unwrap_or("????"),
-                             state.session.opts.crate_types.iter().next().map(|t| format!("{:?}",t)).unwrap_or("????".to_string()),
-                             unsafe_blocks_no_unsafe_fn,
-                             unsafe_blocks_no_ffi,
-                             blocks.unsaf, blocks.total,
-                             functions.unsaf, functions.total,
-                             methods.unsaf, methods.total,
-                             impls.unsaf, impls.total,
-                             declares_ffi
-                             );
-                }
+                let krate = state.hir_crate.expect("HIR should exist");
+                let tcx = state.tcx.expect("Type context should exist");
+                let UnsafeData {
+                    unsafe_blocks_no_ffi,
+                    unsafe_blocks_no_unsafe_fn,
+                    blocks,
+                    functions,
+                    methods,
+                    impls,
+                    declares_ffi,
+                } = count_unsafe(krate, tcx);
+                errln!("ANALYSIS: {} {} {}/{}/{}/{} {}/{} {}/{} {}/{} {}",
+                         state.crate_name.unwrap_or("????"),
+                         state.session.opts.crate_types.iter().next().map(|t| format!("{:?}",t)).unwrap_or("????".to_string()),
+                         unsafe_blocks_no_unsafe_fn,
+                         unsafe_blocks_no_ffi,
+                         blocks.unsaf, blocks.total,
+                         functions.unsaf, functions.total,
+                         methods.unsaf, methods.total,
+                         impls.unsaf, impls.total,
+                         declares_ffi
+                         );
                 original_after_analysis_callback(state);
             }
         });
