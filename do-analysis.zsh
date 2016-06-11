@@ -1,10 +1,11 @@
+#!/bin/zsh
 PLUGIN=./src/analyze/plugin.zsh
 
 filename=crate-list.txt
 
 if [ ! -z "$1" ]; then filename=$1; fi
 
-echo "crate target_type blocks functions methods impls"
+echo "crate target_type blocks functions methods impls declarations"
 
 for crate_name in $(cat $filename); do
     cd sources
@@ -16,7 +17,8 @@ for crate_name in $(cat $filename); do
         cd "$crate_name"
         #>&2 echo "Running plugin, ../../$PLUGIN , on $crate_name ... "
         eval rustup run analyze cargo build
-        eval rustup run analyze cargo clean
+        # Remove the final binaryies. We don't use `clean` to avoid rebuilding deps.
+        rm target/debug/*(.)
         cd ..
     fi
     cd ..
