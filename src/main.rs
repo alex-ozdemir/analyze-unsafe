@@ -1,4 +1,4 @@
-#![feature(rustc_private)]
+#![feature(box_patterns,rustc_private)]
 // Alex Ozdemir <aozdemir@hmc.edu>
 // Tool for counting unsafe invocations in an AST
 
@@ -7,8 +7,10 @@ extern crate syntax;
 extern crate rustc;
 extern crate rustc_driver;
 extern crate rustc_serialize;
+extern crate rustc_data_structures;
 
 mod summarize;
+mod dataflow;
 
 use rustc_serialize::json;
 
@@ -16,6 +18,7 @@ use std::path::PathBuf;
 use syntax::{ast,abi,diagnostics};
 use rustc::hir;
 use rustc::hir::intravisit;
+use rustc::mir::mir_map::MirMap;
 use rustc::ty;
 use rustc::session::{config,Session};
 use rustc_driver::{driver,CompilerCalls,RustcDefaultCalls,Compilation};
@@ -258,19 +261,15 @@ impl<'a> CompilerCalls<'a> for AnalyzeUnsafe {
                          impls.unsaf, impls.total,
                          declares_ffi
                          );
-                summarize_unsafe(krate, tcx);
+                //summarize_unsafe(krate, tcx);
+                let mir_map = state.mir_map.expect("We should be in orbit");
+                for (key, mir) in mir_map.map.iter() {
+                    println!("{:?}", key);
+                    dataflow::check_for_deref_of_unknown_ptr(mir);
+                }
                 original_after_analysis_callback(state);
             }
         });
-
-//        let original_after_parse_callback = control.after_parse.callback;
-//        control.after_parse.callback = Box::new(move |state| {
-//            let mut hi = state;
-//            let mut hi2 = hi.session;
-//            let mut hi3 = hi2.opts;
-//            if save_ast { hi.session.opts.debugging_opts.keep_ast = true; }
-//            original_after_parse_callback(hi);
-//        });
         control
     }
 }

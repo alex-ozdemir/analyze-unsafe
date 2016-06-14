@@ -11,8 +11,8 @@ libc = "0"
 
 [[bin]]
 name = "analyze"
-path = "src/analyze/main.rs"
+path = "src/main.rs"
 
-[[bin]]
-name = "download"
-path = "src/download/main.rs"
+#[[bin]]
+#name = "download"
+#path = "src/download/main.rs"

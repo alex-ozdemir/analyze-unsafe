@@ -8,3 +8,4 @@ crates.io-index
 *.out
 *.err
 *.txt
+*.mir
