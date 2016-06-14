@@ -6,11 +6,16 @@ extern crate getopts;
 extern crate syntax;
 extern crate rustc;
 extern crate rustc_driver;
+extern crate rustc_serialize;
+
+mod summarize;
+
+use rustc_serialize::json;
 
 use std::path::PathBuf;
-use syntax::{abi,ast,diagnostics};
+use syntax::{ast,abi,diagnostics};
 use rustc::hir;
-use rustc::hir::intravisit as visit;
+use rustc::hir::intravisit;
 use rustc::ty;
 use rustc::session::{config,Session};
 use rustc_driver::{driver,CompilerCalls,RustcDefaultCalls,Compilation};
@@ -25,9 +30,16 @@ macro_rules! errln(
 );
 
 fn count_unsafe<'a,'tcx>(krate: &hir::Crate, tcx: ty::TyCtxt<'a,'tcx,'tcx>) -> UnsafeData {
-    let mut v = UnsafeVisitor::new(tcx, krate);
-    visit::walk_crate(&mut v, krate);
+    let mut v = UnsafeCounter::new(tcx, krate);
+    intravisit::walk_crate(&mut v, krate);
     v.data
+}
+
+fn summarize_unsafe<'a,'tcx>(krate: &hir::Crate, tcx: ty::TyCtxt<'a,'tcx,'tcx>) {
+    let mut v = summarize::UnsafeSummarizer::new(tcx);
+    krate.visit_all_items(&mut v);
+    errln!("JSON:{}", json::as_json(&v.functions));
+    errln!("RUST:{:?}", v.functions);
 }
 
 #[derive(Debug,PartialEq)]
@@ -64,7 +76,7 @@ impl UnsafeData {
 
 unsafe impl Send for UnsafeData {}
 
-struct UnsafeVisitor<'a, 'tcx: 'a, 'b> {
+struct UnsafeCounter<'a, 'tcx: 'a, 'b> {
     data: UnsafeData,
     tcx: ty::TyCtxt<'a, 'tcx, 'tcx>,
     krate: &'b hir::Crate,
@@ -72,9 +84,9 @@ struct UnsafeVisitor<'a, 'tcx: 'a, 'b> {
     has_unsafe_fn: bool,
 }
 
-impl<'a,'tcx:'a,'b> UnsafeVisitor<'a,'tcx,'b> {
-    fn new(tcx: ty::TyCtxt<'a,'tcx,'tcx>, krate: &'b hir::Crate) -> UnsafeVisitor<'a,'tcx,'b> {
-        UnsafeVisitor {
+impl<'a,'tcx:'a,'b> UnsafeCounter<'a,'tcx,'b> {
+    fn new(tcx: ty::TyCtxt<'a,'tcx,'tcx>, krate: &'b hir::Crate) -> UnsafeCounter<'a,'tcx,'b> {
+        UnsafeCounter {
             data: UnsafeData::new(),
             tcx: tcx,
             krate: krate,
@@ -84,7 +96,7 @@ impl<'a,'tcx:'a,'b> UnsafeVisitor<'a,'tcx,'b> {
     }
 }
 
-impl<'v, 'a, 'tcx, 'b> visit::Visitor<'v> for UnsafeVisitor<'a,'tcx,'b> {
+impl<'v, 'a, 'tcx, 'b> intravisit::Visitor<'v> for UnsafeCounter<'a,'tcx,'b> {
     fn visit_nested_item(&mut self, id: hir::ItemId) {
         let item = self.krate.items.get(&id.id).expect("ItemId should exist");
         self.visit_item(item);
@@ -110,7 +122,7 @@ impl<'v, 'a, 'tcx, 'b> visit::Visitor<'v> for UnsafeVisitor<'a,'tcx,'b> {
             self.has_unsafe_fn = false;
         }
 
-        visit::walk_block(self, b);
+        intravisit::walk_block(self, b);
 
         // After the dive, update our statistics and reload state if we saved it.
         if is_unsafe_block {
@@ -133,7 +145,7 @@ impl<'v, 'a, 'tcx, 'b> visit::Visitor<'v> for UnsafeVisitor<'a,'tcx,'b> {
                 if abi != abi::Abi::Rust { self.has_ffi = true; }
             };
         };
-        visit::walk_expr(self, expr);
+        intravisit::walk_expr(self, expr);
     }
     fn visit_item(&mut self, i: &'v hir::Item) {
         if let hir::Item_::ItemImpl(unsafety,_ ,_ ,_, _, _) = i.node {
@@ -145,33 +157,33 @@ impl<'v, 'a, 'tcx, 'b> visit::Visitor<'v> for UnsafeVisitor<'a,'tcx,'b> {
         if let hir::Item_::ItemForeignMod(_) = i.node {
             self.data.declares_ffi = true;
         }
-        visit::walk_item(self, i)
+        intravisit::walk_item(self, i)
     }
     fn visit_fn(&mut self,
-                fk: visit::FnKind<'v>,
+                fk: intravisit::FnKind<'v>,
                 fd: &'v hir::FnDecl,
                 b: &'v hir::Block,
                 s: syntax::codemap::Span,
                 _: ast::NodeId) {
         match fk {
-            visit::FnKind::ItemFn(_, _, unsafety, _, _, _, _) => {
+            intravisit::FnKind::ItemFn(_, _, unsafety, _, _, _, _) => {
                 if let hir::Unsafety::Unsafe = unsafety {
                     self.data.functions.unsaf += 1;
                 }
                 self.data.functions.total += 1;
             },
-            visit::FnKind::Method(_, &hir::MethodSig{ unsafety, ..}, _, _) => {
+            intravisit::FnKind::Method(_, &hir::MethodSig{ unsafety, ..}, _, _) => {
                 if let hir::Unsafety::Unsafe = unsafety {
                     self.data.methods.unsaf += 1;
                 }
                 self.data.methods.total += 1;
             },
-            visit::FnKind::Closure(_) => {
+            intravisit::FnKind::Closure(_) => {
                 // Closures cannot be declared unsafe
                 // TODO(aozdemir): There is some interesting work to do here.
             }
         }
-        visit::walk_fn(self, fk, fd, b, s)
+        intravisit::walk_fn(self, fk, fd, b, s)
     }
 }
 
@@ -217,10 +229,12 @@ impl<'a> CompilerCalls<'a> for AnalyzeUnsafe {
         sess: &Session,
         matches: &getopts::Matches
     ) -> driver::CompileController<'a> {
+
         let mut control = self.0.build_controller(sess, matches);
         let do_analysis = self.1;
         let original_after_analysis_callback = control.after_analysis.callback;
         control.after_analysis.callback = Box::new(move |state| {
+            state.session.abort_if_errors();
             if do_analysis {
                 let krate = state.hir_crate.expect("HIR should exist");
                 let tcx = state.tcx.expect("Type context should exist");
@@ -244,6 +258,7 @@ impl<'a> CompilerCalls<'a> for AnalyzeUnsafe {
                          impls.unsaf, impls.total,
                          declares_ffi
                          );
+                summarize_unsafe(krate, tcx);
                 original_after_analysis_callback(state);
             }
         });
