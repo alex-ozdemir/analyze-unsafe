@@ -123,8 +123,7 @@ impl<'a> CompilerCalls<'a> for AnalyzeUnsafe {
                          );
                 summarize_unsafe(krate, tcx);
                 let mir_map = state.mir_map.expect("We should be in orbit");
-                for (key, mir) in mir_map.map.iter() {
-                    println!("{:?}", key);
+                for (_, mir) in mir_map.map.iter() {
                     for err_span in dataflow::check_for_deref_of_unknown_ptr(mir) {
                         state.session.span_warn(err_span, "Dereference of unknown raw pointer!");
                     }
