@@ -4,7 +4,7 @@
 
 extern crate getopts;
 extern crate syntax;
-extern crate rustc;
+#[macro_use] extern crate rustc;
 extern crate rustc_driver;
 extern crate rustc_serialize;
 extern crate rustc_data_structures;
@@ -265,7 +265,9 @@ impl<'a> CompilerCalls<'a> for AnalyzeUnsafe {
                 let mir_map = state.mir_map.expect("We should be in orbit");
                 for (key, mir) in mir_map.map.iter() {
                     println!("{:?}", key);
-                    dataflow::check_for_deref_of_unknown_ptr(mir);
+                    for err_span in dataflow::check_for_deref_of_unknown_ptr(mir) {
+                        state.session.span_warn(err_span, "Dereference of unknown raw pointer!");
+                    }
                 }
                 original_after_analysis_callback(state);
             }
