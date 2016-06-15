@@ -1,14 +1,12 @@
 // Alex Ozdemir <aozdemri@hmc.edu>
 // File for doing dataflow analysis on a CFG.
 
-use rustc::mir::repr::{self,Arg,BasicBlock,Lvalue,LvalueProjection,Mir,Operand,ProjectionElem,Rvalue,Statement,START_BLOCK,Temp,Var};
+use rustc::mir::repr::{self,Arg,BasicBlock,Lvalue,LvalueProjection,Mir,Operand,ProjectionElem,Rvalue,START_BLOCK,Temp,Var};
 use rustc::mir::traversal;
 use rustc::hir::def_id::DefId;
 use rustc::ty;
 
 use syntax::codemap::Span;
-
-use rustc_data_structures::indexed_vec::{Idx};
 
 use std::collections::{HashSet,HashMap};
 
@@ -29,9 +27,12 @@ enum BaseVar {
 // Our facts are sets of Lvalues that are tainted
 type Facts<'tcx> = HashSet<BaseVar>;
 
+/// Analyzes a MIR, checks if an input raw pointer ever gets dereferenced.
+/// Returns a vector containing all the problematic Spans - the locations of the dereference.
 pub fn check_for_deref_of_unknown_ptr<'b,'tcx>(mir: &'b Mir<'tcx>) -> Vec<Span> {
     let mut tainted_vars: HashMap<StatementIdx,Facts<'tcx>> = HashMap::new();
     tainted_vars.insert(START, HashSet::new());
+
     for (id, arg) in mir.arg_decls.iter_enumerated() {
         match arg.ty.sty {
             ty::TypeVariants::TyRawPtr(_) => {
@@ -41,11 +42,13 @@ pub fn check_for_deref_of_unknown_ptr<'b,'tcx>(mir: &'b Mir<'tcx>) -> Vec<Span> 
             _ => { /* No other types start tainted */ },
         };
     }
-    //TODO: terminate on stability, rather than count
-    for i in 0..(traversal::reverse_postorder(mir).count()) {
+
+    let mut stable = false;
+    while !stable {
+        stable = true;
         for (bb_idx, basic_block) in traversal::reverse_postorder(mir) {
 
-            // Push the taint therough the statements that make the BB
+            // Push the taint through the statements that make the BB
             for (s_idx, statement) in basic_block.statements.iter().enumerate() {
                 //println!("Working on BB {:?}, Stmt {:?}.", bb_idx, s_idx);
 
@@ -66,7 +69,12 @@ pub fn check_for_deref_of_unknown_ptr<'b,'tcx>(mir: &'b Mir<'tcx>) -> Vec<Span> 
                                                 .expect("rev-postorder");
 
                     // All originally tainted variables are still tainted.
-                    old_taint.iter().map(|var| next_taint.insert(*var)).count();
+                    for tainted_var in old_taint.iter() {
+                        if !next_taint.contains(tainted_var) {
+                            stable = false;
+                            next_taint.insert(*tainted_var);
+                        }
+                    }
 
                     // The assigned variable is now tainted iff any inputs were tainted.
                     tainted_inputs = old_taint.iter()
@@ -74,21 +82,22 @@ pub fn check_for_deref_of_unknown_ptr<'b,'tcx>(mir: &'b Mir<'tcx>) -> Vec<Span> 
                 }
 
                 if tainted_inputs {
-                    next_taint.insert(lvalue_to_var(lvalue));
-                } else {
-                    next_taint.remove(&lvalue_to_var(lvalue));
+                    let var = lvalue_to_var(lvalue);
+                    if !next_taint.contains(&var) {
+                        stable = false;
+                        next_taint.insert(var);
+                    }
                 }
+                // While technically a location assigned a non-tainted value is no longer tainted,
+                // this can actually be ignored, because we start with all locations untainted, and
+                // the taint analysis is a union over all paths.
+                // Otherwise we'd remove the lvalue if the inputs weren't tainted.
 
                 tainted_vars.insert(next_stmnt_idx, next_taint);
             }
 
             // Insert the taint into the next block(s)
-            // Note: we only ever add taint to the next blocks.
-            // Universally speaking, the only way to lose taint is by assigning untainted values to
-            // tainted locations. However, because taint is forward-may (union of all paths), so
-            // once taint has been assigned it cannot be removed.
-            // That is, if there was ever a path from START to block B which tainted location x at
-            // B, then that taint can never be removed.
+            // Note: we only ever add taint to the next blocks, for the same reason as before
             let last_stmnt_idx = StatementIdx(bb_idx, basic_block.statements.len());
 
             for succ_bb_idx in basic_block.terminator().successors().iter() {
@@ -97,7 +106,10 @@ pub fn check_for_deref_of_unknown_ptr<'b,'tcx>(mir: &'b Mir<'tcx>) -> Vec<Span> 
 
                 // Just computed the last taint above
                 for var in tainted_vars.get(&last_stmnt_idx).unwrap() {
-                    next_taint.insert(*var);
+                    if !next_taint.contains(var) {
+                        stable = false;
+                        next_taint.insert(*var);
+                    }
                 }
 
                 tainted_vars.insert(next_stmnt_idx, next_taint);
@@ -172,7 +184,7 @@ fn lvalue_derefs_var(lvalue: &Lvalue, var: BaseVar) -> bool {
     match (lvalue, var) {
         (&Lvalue::Projection(box LvalueProjection { ref base, elem: ProjectionElem::Deref }),
             var) => lvalue_contains_var(base, var),
-        (&Lvalue::Projection(box LvalueProjection { ref base, ref elem }), var) =>
+        (&Lvalue::Projection(box LvalueProjection { ref base, .. }), var) =>
             lvalue_derefs_var(base, var),
         _ => false,
     }
