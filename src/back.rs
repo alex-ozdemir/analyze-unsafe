@@ -1,6 +1,7 @@
 
 use rustc::hir::{self, intravisit};
-use rustc::mir::repr::{self,BasicBlock,Lvalue,Mir,Operand,Rvalue,START_BLOCK,StatementKind};
+use rustc::mir::repr::{BasicBlock,Constant,Literal,Lvalue,Mir,Operand,Rvalue,START_BLOCK,
+                       StatementKind};
 use rustc::mir::traversal;
 use rustc::mir::mir_map::MirMap;
 use rustc::ty;
@@ -54,8 +55,9 @@ impl<'mir,'tcx, Fact> AnalysisState<'mir,'tcx,Fact> {
     // If there is MIR for the value of this operand, this functions finds it (assuming the operand
     // is just constant).
     fn get_fn_node_id(&self, func_op: &Operand<'tcx>) -> Option<NodeId> {
+        use rustc::mir::repr::{};
         match func_op {
-            &repr::Operand::Constant(repr::Constant{ literal: repr::Literal::Item { def_id, .. }, .. }) =>
+            &Operand::Constant(Constant{ literal: Literal::Item { def_id, .. }, .. }) =>
                 self.tcx.map.as_local_node_id(def_id).and_then(|node_id|
                     if self.mir_map.map.contains_key(&node_id) { Some(node_id) }
                     else { None }
@@ -78,16 +80,15 @@ impl<'mir,'tcx, Fact> AnalysisState<'mir,'tcx,Fact> {
 }
 
 impl<'mir,'tcx> AnalysisState<'mir,'tcx,BaseVar> {
-    pub fn get_concerns(&self,
-                        analysis: &ty::CrateAnalysis,
-                        hir: &hir::Crate)
-                        -> Vec<(Span,String)> {
-        let unsafe_fn_ids = get_unsafe_fn_ids(hir);
+    pub fn get_lints(&self,
+                     analysis: &ty::CrateAnalysis,
+                     hir: &hir::Crate)
+                     -> Vec<(Span,String)> {
+        let unsafe_fn_ids = unsafe_fn_ids::get(hir);
         analysis.access_levels.map.iter().filter(|&(id, _)|
             !unsafe_fn_ids.contains(id)
         ).filter_map(|(id, _)| {
             self.node_id_to_mir(id).and_then(|mir| {
-                //println!("The function with id {:?} has access level {:?}", id, access_level);
                 let start_facts = self.crate_fact_maps_normal_return.get(id).unwrap()
                     .get(&START_STMT).unwrap();
                 let concerning_arguments: Vec<_> = start_facts.iter().filter_map(|var| {
@@ -136,9 +137,6 @@ impl BackwardsAnalysis for EscapeAnalysis {
         }
         let mut vars_used_for_derefs = vec![];
         rvalue_ptr_derefs(mir, tcx, rval, &mut vars_used_for_derefs);
-        //if vars_used_for_derefs.len() > 0 {
-            //println!("`{:?}` derefs {:?}", statement, vars_used_for_derefs);
-        //}
         vars_used_for_derefs.into_iter().map(|fact| pre_facts.insert(fact)).count();
         pre_facts
     }
@@ -193,7 +191,7 @@ pub trait BackwardsAnalysis {
         state
     }
 
-    // Flows till convergence
+    // Flows till convergence on a single function - just looks up the results of other functions.
     fn flow_mir<'mir,'tcx>(mir_id: NodeId,
                            state: &mut AnalysisState<Self::Fact>,
                            return_is_critical: bool)
@@ -214,15 +212,18 @@ pub trait BackwardsAnalysis {
                 match basic_block.terminator().kind {
                     DropAndReplace{ ref location, ref value, ref target, .. } => {
                         let post_idx = StatementIdx(*target, 0);
-                        let assignment = StatementKind::Assign(location.clone(), Rvalue::Use(value.clone()));
-                        if Self::apply_transfer(mir, state.tcx, &mut mir_facts, pre_idx, post_idx, &assignment) {
+                        let assignment = StatementKind::Assign(location.clone(),
+                                                               Rvalue::Use(value.clone()));
+                        if Self::apply_transfer(mir, state.tcx, &mut mir_facts,
+                                                pre_idx, post_idx, &assignment) {
                             stable = false;
                         }
                     },
                     Call { destination: Some((ref lval, next_bb)), ref func, ref args, .. } => {
                         let fn_id = state.get_fn_node_id(func);
                         let post_idx = StatementIdx(next_bb, 0);
-                        let result_is_critical = mir_facts.get(&post_idx).unwrap().contains(&Self::lvalue_to_fact(lval));
+                        let result_is_critical = mir_facts.get(&post_idx).unwrap()
+                            .contains(&Self::lvalue_to_fact(lval));
                         let arg_indices = fn_id.map_or_else(|| {
                             (0..args.len()).collect::<Vec<_>>()
                         }, |id| {
@@ -231,7 +232,8 @@ pub trait BackwardsAnalysis {
                             } else {
                                 &mut state.crate_fact_maps_critical_return
                             };
-                            let relevant_facts = func_map.entry(id).or_insert(HashMap::new()).entry(START_STMT).or_insert(HashSet::new());
+                            let relevant_facts = func_map.entry(id).or_insert(HashMap::new())
+                                .entry(START_STMT).or_insert(HashSet::new());
                             let mut indices = relevant_facts.iter().filter_map(
                                 |fact| Self::fact_to_input_idx(*fact)
                             ).collect::<Vec<_>>();
@@ -330,16 +332,16 @@ pub trait BackwardsAnalysis {
         mir_facts.insert(pre_idx, new_pre_facts);
         change
     }
-
 }
 
-fn get_unsafe_fn_ids<'a>(hir: &'a hir::Crate) -> HashSet<NodeId> {
+
+pub fn get<'a>(hir: &'a hir::Crate) -> HashSet<NodeId> {
     let mut visitor = UnsafeIdLister{ set: HashSet::new() };
     hir.visit_all_items(&mut visitor);
     visitor.set
 }
 
-pub struct UnsafeIdLister {
+struct UnsafeIdLister {
     pub set: HashSet<NodeId>
 }
 
@@ -355,7 +357,6 @@ impl<'v> intravisit::Visitor<'v> for UnsafeIdLister {
         };
     }
 }
-
 
 #[allow(dead_code)]
 fn print_map_lines<K: Debug + Eq + Hash, V: Debug>(map: &HashMap<K, V>) {
