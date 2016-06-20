@@ -1,12 +1,28 @@
 #![allow(dead_code)]
-fn id1(p: *const i32) -> *const i32 {
-    let pp: *const *const i32 = &p;
-    unsafe { *pp } // Ok
+
+// Since you can have pointers to pointers, etc, and assign to pointers, we need to do some path
+// analysis or type-based path-like analysis
+
+pub fn maybe<T>(p: *const T) -> _ {
+     let pp: *const _ = &p;
+     unsafe {
+        *pp   // Okay
+        //**pp   Danger!
+        //***pp  Type Error!
+    }
 }
 
-fn id2(p: *const i32) -> i32 {
-    let pp: *const *const i32 = &p;
-    unsafe { **pp } // Not Okay
+// Okay
+pub fn ok<T>(t: T) -> T {
+     let p: *const _ = &t;
+     unsafe { *p }
+}
+
+
+// Not okay
+pub fn mov<T>(p: *const T, i: isize) -> T {
+     let p2 = p.offset(i);
+     unsafe { *p2 }
 }
 
 fn main() { println!("hi"); }

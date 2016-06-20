@@ -36,9 +36,4 @@ pub fn ok2(p: *const i32) -> i32 {
     produce(p)
 }
 
-//pub fn ok3(r: &i32) -> i32 {
-//    let p: *const _ = r;
-//    unsafe { *p }
-//}
-
 fn main() {}
