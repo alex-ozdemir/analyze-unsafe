@@ -2,23 +2,14 @@
 
 Some of my work analyzing use of `unsafe` by crates on `crates.io`.
 
-## Dependencies
+## Runbook
 
-All the rust is handled and build through `cargo`, which handles dependencies
-:heart:, however, their are also some shell scripts which rely on `cargo-clone`
-and `jq`.
+Right now the repository is set up to run a backwards dataflow analysis to see
+if dereferenced pointers originate in public interfaces.
 
-### `cargo-clone`
-
-This is an experimental cargo subcommand. Install is using `cargo install
-cargo-clone`.
-
-### `jq`
-
-This is a command line tool for viewing and modifying JSON. It is available
-[here](https://stedolan.github.io/jq/), and can also likely be installed using
-a package manager. I installed it on Arch using Pacman, like so: `sudo pacman
--S jq`
+To see it in action, check out `examples/v1.rs` and run `cargo run --bin
+analyze -- --sysroot ~/.multirust/toolchains/nightly-x86_64-unknown-linux-gnu
+examples/v1.rs`, where you will need to replace `~/.multirust/toolchains/nightly-x86_64-unknown-linux-gnu` with the location of your nightly install.
 
 ## Write Up
 
