@@ -5,7 +5,7 @@ fn ohno(i: *const i64) -> i64 {
     unsafe { *i }
 }
 
-fn ohno2(i: *const (i64, i64)) -> i64 {
+pub fn ohno2(i: *const (i64, i64)) -> i64 {
     unsafe { (*i).0 }
 }
 
@@ -18,10 +18,6 @@ pub mod hi {
         unsafe { (*i)[2] }
     }
 }
-
-pub use ptr_scare2::hi;
-
-mod ptr_scare2;
 
 pub fn ohno5<'a>(i: *const i32) -> &'a i32 {
     unsafe { &*i }

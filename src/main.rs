@@ -14,6 +14,7 @@ mod dataflow;
 mod count;
 mod back;
 mod base_var;
+mod dep_graph;
 
 use count::UnsafeData;
 

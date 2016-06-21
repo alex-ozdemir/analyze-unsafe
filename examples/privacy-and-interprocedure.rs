@@ -36,4 +36,14 @@ pub fn ok2(p: *const i32) -> i32 {
     produce(p)
 }
 
+#[allow(unused_variables)]
+pub fn choose1(p: *const i32, q: *const i32) -> *const i32 {
+    p
+}
+
+// Only `p` should be a danger
+pub fn bad4(p: *const i32, q: *const i32) -> i32 {
+    unsafe { *choose1(p, q) }
+}
+
 fn main() {}
