@@ -13,6 +13,7 @@ mod summarize;
 mod dataflow;
 mod count;
 mod back;
+mod base_var;
 
 use count::UnsafeData;
 

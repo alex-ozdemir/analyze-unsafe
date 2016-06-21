@@ -1,10 +1,16 @@
 // Alex Ozdemir <aozdemri@hmc.edu>
 // File for doing dataflow analysis on a CFG.
 
-use rustc::mir::repr::{self,Arg,BasicBlock,Lvalue,LvalueProjection,Mir,Operand,ProjectionElem,Rvalue,START_BLOCK,Temp,Terminator,Var};
+use rustc::mir::repr::{self,BasicBlock,Mir,START_BLOCK};
 use rustc::mir::traversal;
-use rustc::hir::def_id::DefId;
 use rustc::ty;
+
+use base_var::{BaseVar,
+               lvalue_to_var,
+               operand_contains_var,
+               rvalue_derefs_var,
+               terminator_derefs_var,
+               rvalue_contains_var};
 
 use syntax::codemap::Span;
 
@@ -14,15 +20,6 @@ use std::collections::{HashSet,HashMap};
 struct StatementIdx(BasicBlock,usize);
 
 const START: StatementIdx = StatementIdx(START_BLOCK,0);
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum BaseVar {
-    Var(Var),
-    Temp(Temp),
-    Arg(Arg),
-    Static(DefId),
-    ReturnPointer,
-}
 
 // Our facts are sets of Lvalues that are tainted
 type Facts<'tcx> = HashSet<BaseVar>;
@@ -133,22 +130,6 @@ pub fn check_for_deref_of_unknown_ptr<'b,'tcx>(mir: &'b Mir<'tcx>) -> Vec<Span> 
                         }
                     },
                 Call{ destination: Some((ref lval, next_bb)), ref func, ref args, .. } => {
-                    //match func {
-                    //    &Operand::Constant(ref v) => {
-                    //        println!("Constant({:?})", v);
-                    //        match v.literal {
-                    //            repr::Literal::Item { ref def_id, .. } => {
-                    //                println!("  - is item");
-                    //                println!("{:?}", def_id);
-                    //                println!("{:?}", def_id.is_local());
-                    //            },
-                    //            _ => (),
-                    //        };
-                    //    }
-                    //    _ => (),
-                    //    // &Operand::Consume(ref v) => println!("Consume({:?})", v),
-                    //};
-                    // println!("Function: {:?}", func);
                     let tainted_args = tainted_vars.get(&idx).unwrap().iter()
                         .any(|var| args.iter().any(|arg| operand_contains_var(arg, *var)));
                     let tainted_fn = tainted_vars.get(&idx).unwrap().iter()
@@ -199,232 +180,4 @@ pub fn check_for_deref_of_unknown_ptr<'b,'tcx>(mir: &'b Mir<'tcx>) -> Vec<Span> 
         }
     }
     spans
-}
-
-
-pub fn lvalue_to_var(lvalue: &Lvalue) -> BaseVar {
-    use rustc::mir::repr::Lvalue::*;
-    match *lvalue {
-        Var(v) => BaseVar::Var(v),
-        Temp(v) => BaseVar::Temp(v),
-        Arg(v) => BaseVar::Arg(v),
-        Static(v) => BaseVar::Static(v),
-        ReturnPointer => BaseVar::ReturnPointer,
-        Projection(box LvalueProjection { ref base, .. }) => lvalue_to_var(base),
-    }
-}
-
-pub fn terminator_derefs_var(terminator: &Terminator, var: BaseVar) -> bool {
-    use rustc::mir::repr::TerminatorKind::*;
-    match terminator.kind {
-        If{ cond: ref op, .. } |
-        Assert{ cond: ref op, .. } => operand_derefs_var(op, var),
-
-        DropAndReplace{ location: ref lval, value: ref op, .. } =>
-            operand_derefs_var(op, var) || lvalue_derefs_var(lval, var),
-
-        Switch{ discr: ref lval, .. } |
-        SwitchInt{ discr: ref lval, .. } |
-        Drop{ location: ref lval, .. } => lvalue_derefs_var(lval, var),
-
-        Call { ref func, ref args, .. } =>
-            operand_derefs_var(func, var) || args.iter().any(|op| operand_derefs_var(op, var)),
-        Goto { .. } | Resume | Return | Unreachable => false,
-    }
-}
-
-pub fn rvalue_derefs_var(rvalue: &Rvalue, var: BaseVar) -> bool {
-    use rustc::mir::repr::Rvalue::*;
-    match *rvalue {
-        Use(ref operand) |
-        Repeat(ref operand, _) |
-        Cast(_, ref operand, _) |
-        UnaryOp(_, ref operand) => operand_derefs_var(operand, var),
-
-        BinaryOp(_, ref o1, ref o2) |
-        CheckedBinaryOp(_, ref o1, ref o2) =>
-            operand_derefs_var(o1, var) || operand_derefs_var(o2, var),
-
-        Ref(_, _, ref lvalue) |
-        Len(ref lvalue) => lvalue_derefs_var(lvalue, var),
-
-        Aggregate(_, ref operands) => operands.iter().any(|o| operand_derefs_var(o, var)),
-        InlineAsm { .. } => unimplemented!(),
-        Box(_) => false,
-    }
-}
-
-pub fn operand_derefs_var(operand: &Operand, var: BaseVar) -> bool {
-    use rustc::mir::repr::Operand::*;
-    match *operand {
-        Consume(ref lvalue) => lvalue_derefs_var(lvalue, var),
-        Constant(_) => false,
-    }
-}
-
-pub fn lvalue_derefs_var(lvalue: &Lvalue, var: BaseVar) -> bool {
-    match (lvalue, var) {
-        (&Lvalue::Projection(box LvalueProjection { ref base, elem: ProjectionElem::Deref }),
-            var) => lvalue_contains_var(base, var),
-        (&Lvalue::Projection(box LvalueProjection { ref base, .. }), var) =>
-            lvalue_derefs_var(base, var),
-        _ => false,
-    }
-}
-
-pub fn rvalue_contains_var(rvalue: &Rvalue, var: BaseVar) -> bool {
-    use rustc::mir::repr::Rvalue::*;
-    match *rvalue {
-        Use(ref operand) |
-        Repeat(ref operand, _) |
-        Cast(_, ref operand, _) |
-        UnaryOp(_, ref operand) => operand_contains_var(operand, var),
-
-        BinaryOp(_, ref o1, ref o2) |
-        CheckedBinaryOp(_, ref o1, ref o2) =>
-            operand_contains_var(o1, var) || operand_contains_var(o2, var),
-
-        Ref(_, _, ref lvalue) |
-        Len(ref lvalue) => lvalue_contains_var(lvalue, var),
-
-        Aggregate(_, ref operands) => operands.iter().any(|o| operand_contains_var(o, var)),
-        InlineAsm { .. } => unimplemented!(),
-        Box(_) => false,
-    }
-}
-
-pub fn operand_contains_var(operand: &Operand, var: BaseVar) -> bool {
-    use rustc::mir::repr::Operand::*;
-    match *operand {
-        Consume(ref lvalue) => lvalue_contains_var(lvalue, var),
-        Constant(_) => false,
-    }
-}
-
-pub fn lvalue_contains_var(lvalue: &Lvalue, var: BaseVar) -> bool {
-    match (lvalue, var) {
-        (&Lvalue::Var(ref v1), BaseVar::Var(v2)) => *v1 == v2,
-        (&Lvalue::Temp(ref v1), BaseVar::Temp(v2)) => *v1 == v2,
-        (&Lvalue::Arg(ref v1), BaseVar::Arg(v2)) => *v1 == v2,
-        (&Lvalue::Static(ref v1), BaseVar::Static(v2)) => *v1 == v2,
-        (&Lvalue::ReturnPointer, BaseVar::ReturnPointer) => true,
-        (&Lvalue::Projection(box LvalueProjection { ref base, ref elem }), var) =>
-            lvalue_contains_var(base, var) || match elem {
-                &ProjectionElem::Index(ref operand) => operand_contains_var(operand, var),
-                _ => false,
-            },
-        _ => false,
-    }
-}
-
-pub fn rvalue_used_vars(rvalue: &Rvalue, out: &mut Vec<BaseVar>) {
-    use rustc::mir::repr::Rvalue::*;
-    match *rvalue {
-        Use(ref operand) |
-        Repeat(ref operand, _) |
-        Cast(_, ref operand, _) |
-        UnaryOp(_, ref operand) => operand_used_vars(operand, out),
-
-        BinaryOp(_, ref o1, ref o2) |
-        CheckedBinaryOp(_, ref o1, ref o2) => {
-            operand_used_vars(o1, out);
-            operand_used_vars(o2, out);
-        }
-
-        Ref(_, _, ref lvalue) |
-        Len(ref lvalue) => lvalue_used_vars(lvalue, out),
-
-        Aggregate(_, ref operands) =>
-            {operands.iter().map(|o| operand_used_vars(o, out)).count();},
-        InlineAsm { .. } => unimplemented!(),
-        Box(_) => (),
-    }
-}
-
-pub fn operand_used_vars(operand: &Operand, out: &mut Vec<BaseVar>) {
-    use rustc::mir::repr::Operand::*;
-    match operand {
-        &Consume(ref lvalue) => lvalue_used_vars(lvalue, out),
-        //TODO: Is this correct?
-        &Constant(_) => (),
-    }
-}
-
-pub fn lvalue_used_vars(lvalue: &Lvalue, out: &mut Vec<BaseVar>) {
-    match lvalue {
-        &Lvalue::Var(ref v1) => out.push(BaseVar::Var(*v1)),
-        &Lvalue::Temp(ref v1) => out.push(BaseVar::Temp(*v1)),
-        &Lvalue::Arg(ref v1) => out.push(BaseVar::Arg(*v1)),
-        &Lvalue::Static(ref v1) => out.push(BaseVar::Static(*v1)),
-        &Lvalue::ReturnPointer => out.push(BaseVar::ReturnPointer),
-        &Lvalue::Projection(box LvalueProjection { ref base, ref elem }) => {
-            lvalue_used_vars(base, out);
-            match elem {
-                &ProjectionElem::Index(ref operand) => operand_used_vars(operand, out),
-                _ => (),
-            };
-        },
-    }
-}
-
-pub fn rvalue_ptr_derefs<'tcx, 'mir, 'gcx>(mir: &Mir<'tcx>,
-                                           tcx: ty::TyCtxt<'mir, 'gcx, 'tcx>,
-                                           rvalue: &Rvalue<'tcx>,
-                                           out: &mut Vec<BaseVar>) {
-    use rustc::mir::repr::Rvalue::*;
-    match *rvalue {
-        Use(ref operand) |
-        Repeat(ref operand, _) |
-        Cast(_, ref operand, _) |
-        UnaryOp(_, ref operand) => operand_ptr_derefs(mir, tcx, operand, out),
-
-        BinaryOp(_, ref o1, ref o2) |
-        CheckedBinaryOp(_, ref o1, ref o2) => {
-            operand_ptr_derefs(mir, tcx, o1, out);
-            operand_ptr_derefs(mir, tcx, o2, out);
-        }
-
-        Ref(_, _, ref lvalue) |
-        Len(ref lvalue) => lvalue_ptr_derefs(mir, tcx, lvalue, out),
-
-        Aggregate(_, ref operands) =>
-            {operands.iter().map(|o| operand_ptr_derefs(mir, tcx, o, out)).count();},
-        InlineAsm { .. } => unimplemented!(),
-        Box(_) => (),
-    }
-}
-
-pub fn operand_ptr_derefs<'tcx, 'mir, 'gcx>(mir: &Mir<'tcx>,
-                                            tcx: ty::TyCtxt<'mir, 'gcx, 'tcx>,
-                                            operand: &Operand<'tcx>,
-                                            out: &mut Vec<BaseVar>) {
-    use rustc::mir::repr::Operand::*;
-    match operand {
-        &Consume(ref lvalue) => lvalue_ptr_derefs(mir, tcx, lvalue, out),
-        //TODO: Is this correct?
-        &Constant(_) => (),
-    }
-}
-
-//pub fn lvalue_ptr_derefs(mir: &Mir, tcx: &ty::TyCtxt, lvalue: &Lvalue, out: &mut Vec<BaseVar>) {
-pub fn lvalue_ptr_derefs<'tcx, 'mir, 'gcx>(mir: &Mir<'tcx>,
-                                           tcx: ty::TyCtxt<'mir, 'gcx, 'tcx>,
-                                           lvalue: &Lvalue<'tcx>,
-                                           out: &mut Vec<BaseVar>) {
-    match lvalue {
-        &Lvalue::Projection(box LvalueProjection { ref base, ref elem }) => {
-            lvalue_ptr_derefs(mir, tcx, base, out);
-            match elem {
-                &ProjectionElem::Deref => {
-                    let base_ty = mir.lvalue_ty(tcx, base);
-                    if let ty::TypeVariants::TyRawPtr(_) = base_ty.to_ty(tcx).sty {
-                        lvalue_used_vars(base, out);
-                    }
-                },
-                &ProjectionElem::Index(ref operand) => operand_ptr_derefs(mir, tcx, operand, out),
-                _ => (),
-            };
-        },
-        _ => (),
-    }
 }

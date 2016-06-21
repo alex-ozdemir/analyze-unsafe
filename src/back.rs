@@ -1,13 +1,28 @@
+// Alex Ozdemir <aozdemir@hmc.edu>
+//
+// A backwards data-flow analysis for determining when functions are dereferencing unverified types
+// entered by a public interface.
 
 use rustc::hir::{self, intravisit};
-use rustc::mir::repr::{BasicBlock,Constant,Literal,Lvalue,Mir,Operand,Rvalue,START_BLOCK,
+use rustc::mir::repr::{BasicBlock,
+                       Constant,
+                       Literal,
+                       Lvalue,
+                       Mir,
+                       Operand,
+                       Rvalue,
+                       START_BLOCK,
                        StatementKind};
 use rustc::mir::traversal;
 use rustc::mir::mir_map::MirMap;
 use rustc::ty;
 use rustc_data_structures::indexed_vec::Idx;
 
-use dataflow::{BaseVar,lvalue_to_var,operand_used_vars,rvalue_ptr_derefs,rvalue_used_vars};
+use base_var::{BaseVar,
+               lvalue_to_var,
+               operand_used_vars,
+               rvalue_ptr_derefs,
+               rvalue_used_vars};
 
 use syntax::ast::NodeId;
 use syntax::codemap::Span;
@@ -43,8 +58,7 @@ pub struct AnalysisState<'mir,'tcx: 'mir,Fact> {
 
 impl<'mir,'tcx, Fact> AnalysisState<'mir,'tcx,Fact> {
     fn new(mir_map: &'mir MirMap<'tcx>, tcx: ty::TyCtxt<'mir,'tcx,'tcx>)
-           -> AnalysisState<'mir,'tcx,Fact> {
-        AnalysisState{
+           -> AnalysisState<'mir,'tcx,Fact> { AnalysisState{
             mir_map: mir_map,
             tcx: tcx,
             crate_fact_maps_normal_return: HashMap::new(),
@@ -84,7 +98,7 @@ impl<'mir,'tcx> AnalysisState<'mir,'tcx,BaseVar> {
                      analysis: &ty::CrateAnalysis,
                      hir: &hir::Crate)
                      -> Vec<(Span,String)> {
-        let unsafe_fn_ids = unsafe_fn_ids::get(hir);
+        let unsafe_fn_ids = get_unsafe_fn_ids(hir);
         analysis.access_levels.map.iter().filter(|&(id, _)|
             !unsafe_fn_ids.contains(id)
         ).filter_map(|(id, _)| {
@@ -118,6 +132,7 @@ impl<'mir,'tcx> AnalysisState<'mir,'tcx,BaseVar> {
 }
 
 pub struct EscapeAnalysis;
+
 impl BackwardsAnalysis for EscapeAnalysis {
     type Fact = BaseVar;
     fn transfer<'mir,'gcx,'tcx>(mir: &Mir<'tcx>,
@@ -131,13 +146,10 @@ impl BackwardsAnalysis for EscapeAnalysis {
         outs.iter().map(|fact| pre_facts.insert(*fact)).count();
         pre_facts.remove(&lval_fact);
         if outs.contains(&lval_fact) {
-            let mut used_vars = vec![];
-            rvalue_used_vars(rval, &mut used_vars);
-            used_vars.into_iter().map(|fact| pre_facts.insert(fact)).count();
+            rvalue_used_vars(rval).into_iter().map(|fact| pre_facts.insert(fact)).count();
         }
-        let mut vars_used_for_derefs = vec![];
-        rvalue_ptr_derefs(mir, tcx, rval, &mut vars_used_for_derefs);
-        vars_used_for_derefs.into_iter().map(|fact| pre_facts.insert(fact)).count();
+        rvalue_ptr_derefs(mir, tcx, rval).into_iter()
+            .map(|fact| pre_facts.insert(fact)).count();
         pre_facts
     }
     fn join(many: Vec<&HashSet<Self::Fact>>) -> HashSet<Self::Fact> {
@@ -149,9 +161,7 @@ impl BackwardsAnalysis for EscapeAnalysis {
         lvalue_to_var(lvalue)
     }
     fn operand_to_facts(op: &Operand) -> Vec<BaseVar> {
-        let mut out = vec![];
-        operand_used_vars(op, &mut out);
-        out
+        operand_used_vars(op)
     }
     fn return_facts() -> Vec<Self::Fact> {
         vec![BaseVar::ReturnPointer]
@@ -191,7 +201,8 @@ pub trait BackwardsAnalysis {
         state
     }
 
-    // Flows till convergence on a single function - just looks up the results of other functions.
+    /// Flows till convergence on a single function - just looks up the results of other functions.
+    /// Returns whether any changes were made.
     fn flow_mir<'mir,'tcx>(mir_id: NodeId,
                            state: &mut AnalysisState<Self::Fact>,
                            return_is_critical: bool)
@@ -203,10 +214,9 @@ pub trait BackwardsAnalysis {
         let mut any_change = false;
         let mut stable = false;
         while !stable {
-            //println!("Starting {:?}, critical: {}", mir_id, return_is_critical);
             stable = true;
+
             for (bb_idx, basic_block) in traversal::postorder(&mir) {
-                //println!("BB {:?}", bb_idx);
                 let pre_idx = StatementIdx(bb_idx, basic_block.statements.len());
                 use rustc::mir::repr::TerminatorKind::*;
                 match basic_block.terminator().kind {
@@ -335,7 +345,7 @@ pub trait BackwardsAnalysis {
 }
 
 
-pub fn get<'a>(hir: &'a hir::Crate) -> HashSet<NodeId> {
+pub fn get_unsafe_fn_ids<'a>(hir: &'a hir::Crate) -> HashSet<NodeId> {
     let mut visitor = UnsafeIdLister{ set: HashSet::new() };
     hir.visit_all_items(&mut visitor);
     visitor.set
