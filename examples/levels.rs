@@ -3,7 +3,7 @@
 // Since you can have pointers to pointers, etc, and assign to pointers, we need to do some path
 // analysis or type-based path-like analysis
 
-pub fn maybe<T>(p: *const T) -> _ {
+pub fn maybe<T>(p: *const T) -> T {
      let pp: *const _ = &p;
      unsafe {
         *pp   // Okay

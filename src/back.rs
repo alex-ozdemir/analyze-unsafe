@@ -12,7 +12,9 @@ use rustc::mir::repr::{BasicBlock,
                        Operand,
                        Rvalue,
                        START_BLOCK,
-                       StatementKind};
+                       StatementKind,
+                       TerminatorKind,
+};
 use rustc::mir::traversal;
 use rustc::mir::mir_map::MirMap;
 use rustc::ty;
@@ -20,10 +22,13 @@ use rustc_data_structures::indexed_vec::Idx;
 
 use base_var::{BaseVar,
                lvalue_to_var,
+               lvalue_used_vars,
                operand_used_vars,
                rvalue_used_vars,
+               lvalue_ptr_derefs,
+               operand_ptr_derefs,
                rvalue_ptr_derefs,
-               lvalue_ptr_derefs};
+};
 
 use syntax::ast::NodeId;
 use syntax::codemap::Span;
@@ -139,13 +144,29 @@ impl<'mir,'tcx> AnalysisState<'mir,'tcx,BaseVar> {
 
 pub struct EscapeAnalysis;
 
+
+pub enum Expr<'a, 'tcx: 'a> {
+    Lvalue(&'a Lvalue<'tcx>),
+    Rvalue(&'a Rvalue<'tcx>),
+    Operand(&'a Operand<'tcx>)
+}
+
 impl EscapeAnalysis {
-    fn lvalue_to_fact(lvalue: &Lvalue) -> BaseVar {
+    // Maps an LValue to the BaseVar representing its location.
+    fn location(lvalue: &Lvalue) -> BaseVar {
         lvalue_to_var(lvalue)
     }
-    fn operand_to_facts(op: &Operand) -> Vec<BaseVar> {
-        operand_used_vars(op)
+
+    // The base variables which contribute to the value of this expression
+    fn inputs(expr: Expr) -> Vec<BaseVar> {
+        use self::Expr::*;
+        match expr {
+            Lvalue(ref lvalue) => lvalue_used_vars(lvalue),
+            Rvalue(ref rvalue) => rvalue_used_vars(rvalue),
+            Operand(ref operand) => operand_used_vars(operand),
+        }
     }
+
     fn fact_to_input_idx(fact: BaseVar) -> Option<usize> {
         match fact {
             BaseVar::Arg(arg) => Some(arg.index()),
@@ -156,6 +177,19 @@ impl EscapeAnalysis {
 
 impl BackwardsAnalysis for EscapeAnalysis {
     type Fact = BaseVar;
+
+    // The base variables which are made critical by this expression
+    fn generate<'a, 'tcx, 'mir, 'gcx>(mir: &Mir<'tcx>,
+                                      tcx: ty::TyCtxt<'mir,'gcx,'tcx>,
+                                      expr: Expr<'a, 'tcx>) -> Vec<BaseVar> {
+        use self::Expr::*;
+        match expr {
+            Lvalue(ref lvalue) => lvalue_ptr_derefs(mir, tcx, lvalue),
+            Rvalue(ref rvalue) => rvalue_ptr_derefs(mir, tcx, rvalue),
+            Operand(ref operand) => operand_ptr_derefs(mir, tcx, operand),
+        }
+    }
+
     fn transfer<'mir,'gcx,'tcx>(mir: &Mir<'tcx>,
                            tcx: ty::TyCtxt<'mir,'gcx,'tcx>,
                            outs: &HashSet<Self::Fact>,
@@ -163,16 +197,17 @@ impl BackwardsAnalysis for EscapeAnalysis {
                            -> HashSet<Self::Fact> {
         let mut pre_facts = HashSet::new();
         let &StatementKind::Assign(ref lval, ref rval) = statement;
-        let lval_fact = lvalue_to_var(lval);
         outs.iter().map(|fact| pre_facts.insert(*fact)).count();
-        pre_facts.remove(&lval_fact);
-        if outs.contains(&lval_fact) {
-            rvalue_used_vars(rval).into_iter().map(|fact| pre_facts.insert(fact)).count();
+
+        let location = EscapeAnalysis::location(lval);
+        pre_facts.remove(&location);
+
+        if outs.contains(&location) {
+            pre_facts.extend(EscapeAnalysis::inputs(Expr::Rvalue(rval)));
         }
-        lvalue_ptr_derefs(mir, tcx, lval).into_iter()
-            .map(|fact| pre_facts.insert(fact)).count();
-        rvalue_ptr_derefs(mir, tcx, rval).into_iter()
-            .map(|fact| pre_facts.insert(fact)).count();
+
+        pre_facts.extend(EscapeAnalysis::generate(mir, tcx, Expr::Lvalue(lval)));
+        pre_facts.extend(EscapeAnalysis::generate(mir, tcx, Expr::Rvalue(rval)));
         pre_facts
     }
     fn join(many: Vec<&HashSet<Self::Fact>>) -> HashSet<Self::Fact> {
@@ -181,15 +216,22 @@ impl BackwardsAnalysis for EscapeAnalysis {
         pre_facts
     }
     //TODO(aozdemir) handle diverging fn's properly
-    fn fn_call_transfer<'mir,'tcx>(crate_info: &CrateInfo<'mir,'tcx>,
+    fn fn_call_transfer<'mir,'tcx>(mir_id: NodeId,
+                                   crate_info: &CrateInfo<'mir,'tcx>,
                                         context_and_fn_to_fact_map: &CrateFactsMap<Self::Fact>,
                                         post_facts: &HashSet<Self::Fact>,
                                         fn_op: &Operand<'tcx>,
                                         arg_ops: &Vec<Operand<'tcx>>,
                                         dest: &Lvalue<'tcx>)
                                         -> HashSet<Self::Fact> {
+        let mut new_pre_facts = HashSet::new();
+        new_pre_facts.extend(post_facts);
+
+        let location = Self::location(dest);
+        new_pre_facts.remove(&location);
+
         let fn_id = crate_info.get_fn_node_id(fn_op);
-        let result_is_critical = post_facts.contains(&Self::lvalue_to_fact(dest));
+        let result_is_critical = post_facts.contains(&location);
         let critical_indices = fn_id.map_or_else(|| {
             (0..arg_ops.len()).collect::<Vec<_>>()
         }, |id| {
@@ -204,16 +246,18 @@ impl BackwardsAnalysis for EscapeAnalysis {
             indices.sort();
             indices
         });
-        let mut new_pre_facts = HashSet::new();
-        new_pre_facts.extend(post_facts);
-        //let pre_facts = mir_facts.remove(&pre_idx).unwrap_or(HashSet::new());
-        //let mut new_pre_facts = Self::join(vec![mir_facts.get(&post_idx).unwrap()]);
-        new_pre_facts.remove(&Self::lvalue_to_fact(dest));
         if result_is_critical || fn_id.is_some() {
             for arg_idx in critical_indices.iter() {
-                Self::operand_to_facts(&arg_ops[*arg_idx]).into_iter().map(|fact| new_pre_facts.insert(fact)).count();
+                new_pre_facts.extend(Self::inputs(Expr::Operand(&arg_ops[*arg_idx])));
             }
         }
+
+        let mir = crate_info.node_id_to_mir(&mir_id).unwrap();
+        for arg_op in arg_ops {
+            new_pre_facts.extend(Self::generate(mir, crate_info.tcx, Expr::Operand(arg_op)));
+        }
+        new_pre_facts.extend(Self::generate(mir, crate_info.tcx, Expr::Operand(fn_op)));
+        new_pre_facts.extend(Self::generate(mir, crate_info.tcx, Expr::Lvalue(dest)));
         new_pre_facts
     }
     fn return_facts(context: &Context<Self::Fact>) -> Vec<Self::Fact> {
@@ -226,12 +270,17 @@ impl BackwardsAnalysis for EscapeAnalysis {
 
 pub trait BackwardsAnalysis {
     type Fact: PartialEq + Eq + Hash + Clone + Copy + Debug;
+    // The facts which are made by evaluating this expression. Comes up during some terminators.
+    fn generate<'a, 'tcx, 'mir, 'gcx>(mir: &Mir<'tcx>,
+                                      tcx: ty::TyCtxt<'mir,'gcx,'tcx>,
+                                      expr: Expr<'a, 'tcx>) -> Vec<Self::Fact>;
     fn transfer<'mir,'gcx,'tcx>(mir: &Mir<'tcx>,
                                 tcx: ty::TyCtxt<'mir,'gcx,'tcx>,
                                 outs: &HashSet<Self::Fact>,
                                 statement: &StatementKind<'tcx>)
                                 -> HashSet<Self::Fact>;
-    fn fn_call_transfer<'mir,'tcx>(crate_info: &CrateInfo<'mir,'tcx>,
+    fn fn_call_transfer<'mir,'tcx>(mir_id: NodeId,
+                                   crate_info: &CrateInfo<'mir,'tcx>,
                                         context_and_fn_to_fact_map: &CrateFactsMap<Self::Fact>,
                                         post_facts: &HashSet<Self::Fact>,
                                         fn_op: &Operand<'tcx>,
@@ -263,6 +312,21 @@ pub trait BackwardsAnalysis {
                            state: &mut AnalysisState<Self::Fact>,
                            context: Context<Self::Fact>)
                            -> bool {
+
+        // If the terminator just evaluates an expression (no assignment), this produces that
+        // expression.
+        fn evaluated_expression<'a, 'tcx: 'a>(kind: &'a TerminatorKind<'tcx>) -> Option<Expr<'a, 'tcx>> {
+            use rustc::mir::repr::TerminatorKind::*;
+            match kind {
+                &If { ref cond, .. } |
+                &Assert { ref cond, .. } => Some(Expr::Operand(cond)),
+                &Switch { discr: ref lval, .. } |
+                &SwitchInt { discr: ref lval, .. } |
+                &Drop { location: ref lval, .. } => Some(Expr::Lvalue(lval)),
+                _ => None,
+            }
+        }
+
         let mir = state.info.mir_map.map.get(&mir_id).unwrap();
         let mut mir_facts = state.context_and_fn_to_fact_map.remove(&(context.clone(), mir_id)).unwrap_or(HashMap::new());
 
@@ -288,7 +352,8 @@ pub trait BackwardsAnalysis {
                         let post_idx = StatementIdx(next_bb, 0);
                         let empty_set: HashSet<Self::Fact> = HashSet::new();
                         let new_pre_facts =
-                            Self::fn_call_transfer(&state.info,
+                            Self::fn_call_transfer(mir_id,
+                                                   &state.info,
                                                    &state.context_and_fn_to_fact_map,
                                                    mir_facts.get(&post_idx).unwrap_or(&empty_set),
                                                    func,
@@ -308,7 +373,7 @@ pub trait BackwardsAnalysis {
                         }
                     },
                     ref other => {
-                        let new_pre_facts = {
+                        let mut new_pre_facts = {
                             let mut post_facts = vec![];
                             for succ_bb_idx in other.successors().iter() {
                                 let post_idx = StatementIdx(*succ_bb_idx, 0);
@@ -322,6 +387,7 @@ pub trait BackwardsAnalysis {
                             }
                             Self::join(post_facts)
                         };
+                        evaluated_expression(other).map(|expr| new_pre_facts.extend(Self::generate(mir, state.info.tcx, expr)));
                         let change = new_pre_facts != *mir_facts.entry(pre_idx).or_insert(HashSet::new());
                         if change {
                             stable = false;
