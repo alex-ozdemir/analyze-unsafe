@@ -21,15 +21,17 @@ use rustc_data_structures::indexed_vec::Idx;
 use base_var::{BaseVar,
                lvalue_to_var,
                operand_used_vars,
+               rvalue_used_vars,
                rvalue_ptr_derefs,
-               rvalue_used_vars};
+               lvalue_ptr_derefs};
 
 use syntax::ast::NodeId;
 use syntax::codemap::Span;
 
-use std::collections::{HashSet,HashMap};
-use std::hash::Hash;
+use std::collections::{BTreeSet,HashSet,HashMap};
 use std::fmt::Debug;
+use std::hash::Hash;
+use std::iter;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 // A unique index for each statement in a MIR. First, the basic block, then the position of the
@@ -39,16 +41,11 @@ pub struct StatementIdx(BasicBlock,usize);
 
 const START_STMT: StatementIdx = StatementIdx(START_BLOCK, 0);
 
+pub type Context<Fact> = BTreeSet<Fact>;
 pub type MIRFactsMap<Fact> = HashMap<StatementIdx,HashSet<Fact>>;
-pub type CrateFactsMap<Fact> = HashMap<NodeId,MIRFactsMap<Fact>>;
+pub type CrateFactsMap<Fact> = HashMap<(Context<Fact>,NodeId),MIRFactsMap<Fact>>;
 
-pub struct AnalysisState<'mir,'tcx: 'mir,Fact> {
-    // Holds the fact map for each MIR, as called with a non-critical return
-    pub crate_fact_maps_normal_return: CrateFactsMap<Fact>,
-
-    // Holds the fact map for each MIR, as called with a critical return
-    pub crate_fact_maps_critical_return: CrateFactsMap<Fact>,
-
+pub struct CrateInfo<'mir,'tcx:'mir> {
     // The MIRs for the crate
     pub mir_map: &'mir MirMap<'tcx>,
 
@@ -56,18 +53,35 @@ pub struct AnalysisState<'mir,'tcx: 'mir,Fact> {
     pub tcx: ty::TyCtxt<'mir,'tcx,'tcx>,
 }
 
-impl<'mir,'tcx, Fact> AnalysisState<'mir,'tcx,Fact> {
+pub struct AnalysisState<'mir,'tcx:'mir,Fact> {
+    // Holds the fact map for each MIR, in each context
+    pub context_and_fn_to_fact_map: CrateFactsMap<Fact>,
+
+    // Info about the crate, independent of the analysis
+    pub info: CrateInfo<'mir,'tcx>,
+}
+
+impl<'mir,'tcx, Fact: Eq + Hash> AnalysisState<'mir,'tcx,Fact> {
     fn new(mir_map: &'mir MirMap<'tcx>, tcx: ty::TyCtxt<'mir,'tcx,'tcx>)
-           -> AnalysisState<'mir,'tcx,Fact> { AnalysisState{
+           -> AnalysisState<'mir,'tcx,Fact> {
+        AnalysisState {
+            context_and_fn_to_fact_map: HashMap::new(),
+            info: CrateInfo::new(mir_map, tcx),
+        }
+    }
+}
+
+impl<'mir,'tcx> CrateInfo<'mir,'tcx> {
+    fn new(mir_map: &'mir MirMap<'tcx>, tcx: ty::TyCtxt<'mir,'tcx,'tcx>)
+           -> CrateInfo<'mir,'tcx> {
+        CrateInfo {
             mir_map: mir_map,
             tcx: tcx,
-            crate_fact_maps_normal_return: HashMap::new(),
-            crate_fact_maps_critical_return: HashMap::new()
         }
     }
 
-    // If there is MIR for the value of this operand, this functions finds it (assuming the operand
-    // is just constant).
+    // If there is MIR for the value of this operand, this functions finds its ID (assuming the
+    // operand is just constant).
     fn get_fn_node_id(&self, func_op: &Operand<'tcx>) -> Option<NodeId> {
         use rustc::mir::repr::{};
         match func_op {
@@ -77,14 +91,6 @@ impl<'mir,'tcx, Fact> AnalysisState<'mir,'tcx,Fact> {
                     else { None }
                 ),
             _ => None,
-        }
-    }
-
-    fn get_crate_facts_map(&mut self, return_is_critical: bool) -> &mut CrateFactsMap<Fact> {
-        if return_is_critical {
-            &mut self.crate_fact_maps_critical_return
-        } else {
-            &mut self.crate_fact_maps_normal_return
         }
     }
 
@@ -102,8 +108,8 @@ impl<'mir,'tcx> AnalysisState<'mir,'tcx,BaseVar> {
         analysis.access_levels.map.iter().filter(|&(id, _)|
             !unsafe_fn_ids.contains(id)
         ).filter_map(|(id, _)| {
-            self.node_id_to_mir(id).and_then(|mir| {
-                let start_facts = self.crate_fact_maps_normal_return.get(id).unwrap()
+            self.info.node_id_to_mir(id).and_then(|mir| {
+                let start_facts = self.context_and_fn_to_fact_map.get(&(BTreeSet::new(), *id)).unwrap()
                     .get(&START_STMT).unwrap();
                 let concerning_arguments: Vec<_> = start_facts.iter().filter_map(|var| {
                     match var {
@@ -114,7 +120,7 @@ impl<'mir,'tcx> AnalysisState<'mir,'tcx,BaseVar> {
                 if concerning_arguments.len() == 0 {
                     None
                 } else {
-                    let fn_name = self.tcx.item_path_str(self.tcx.map.local_def_id(*id));
+                    let fn_name = self.info.tcx.item_path_str(self.info.tcx.map.local_def_id(*id));
                     let arguments: Vec<_>= concerning_arguments.iter().map(|name|
                         format!("`{}`", name)
                     ).collect();
@@ -133,6 +139,21 @@ impl<'mir,'tcx> AnalysisState<'mir,'tcx,BaseVar> {
 
 pub struct EscapeAnalysis;
 
+impl EscapeAnalysis {
+    fn lvalue_to_fact(lvalue: &Lvalue) -> BaseVar {
+        lvalue_to_var(lvalue)
+    }
+    fn operand_to_facts(op: &Operand) -> Vec<BaseVar> {
+        operand_used_vars(op)
+    }
+    fn fact_to_input_idx(fact: BaseVar) -> Option<usize> {
+        match fact {
+            BaseVar::Arg(arg) => Some(arg.index()),
+            _ => None,
+        }
+    }
+}
+
 impl BackwardsAnalysis for EscapeAnalysis {
     type Fact = BaseVar;
     fn transfer<'mir,'gcx,'tcx>(mir: &Mir<'tcx>,
@@ -148,6 +169,8 @@ impl BackwardsAnalysis for EscapeAnalysis {
         if outs.contains(&lval_fact) {
             rvalue_used_vars(rval).into_iter().map(|fact| pre_facts.insert(fact)).count();
         }
+        lvalue_ptr_derefs(mir, tcx, lval).into_iter()
+            .map(|fact| pre_facts.insert(fact)).count();
         rvalue_ptr_derefs(mir, tcx, rval).into_iter()
             .map(|fact| pre_facts.insert(fact)).count();
         pre_facts
@@ -157,20 +180,47 @@ impl BackwardsAnalysis for EscapeAnalysis {
         many.iter().map(|facts| facts.iter().map(|fact| pre_facts.insert(*fact)).count()).count();
         pre_facts
     }
-    fn lvalue_to_fact(lvalue: &Lvalue) -> Self::Fact {
-        lvalue_to_var(lvalue)
-    }
-    fn operand_to_facts(op: &Operand) -> Vec<BaseVar> {
-        operand_used_vars(op)
-    }
-    fn return_facts() -> Vec<Self::Fact> {
-        vec![BaseVar::ReturnPointer]
-    }
-    fn fact_to_input_idx(fact: Self::Fact) -> Option<usize> {
-        match fact {
-            BaseVar::Arg(arg) => Some(arg.index()),
-            _ => None,
+    //TODO(aozdemir) handle diverging fn's properly
+    fn fn_call_transfer<'mir,'tcx>(crate_info: &CrateInfo<'mir,'tcx>,
+                                        context_and_fn_to_fact_map: &CrateFactsMap<Self::Fact>,
+                                        post_facts: &HashSet<Self::Fact>,
+                                        fn_op: &Operand<'tcx>,
+                                        arg_ops: &Vec<Operand<'tcx>>,
+                                        dest: &Lvalue<'tcx>)
+                                        -> HashSet<Self::Fact> {
+        let fn_id = crate_info.get_fn_node_id(fn_op);
+        let result_is_critical = post_facts.contains(&Self::lvalue_to_fact(dest));
+        let critical_indices = fn_id.map_or_else(|| {
+            (0..arg_ops.len()).collect::<Vec<_>>()
+        }, |id| {
+            let mut call_context = BTreeSet::new();
+            if result_is_critical { call_context.insert(BaseVar::ReturnPointer); }
+            let callee_fact_map = context_and_fn_to_fact_map.get(&(call_context, id));
+            let tmp = HashSet::new();
+            let callee_start_facts = callee_fact_map.and_then(|m| m.get(&START_STMT)).unwrap_or(&tmp);
+            let mut indices = callee_start_facts.iter().filter_map(
+                |fact| Self::fact_to_input_idx(*fact)
+            ).collect::<Vec<_>>();
+            indices.sort();
+            indices
+        });
+        let mut new_pre_facts = HashSet::new();
+        new_pre_facts.extend(post_facts);
+        //let pre_facts = mir_facts.remove(&pre_idx).unwrap_or(HashSet::new());
+        //let mut new_pre_facts = Self::join(vec![mir_facts.get(&post_idx).unwrap()]);
+        new_pre_facts.remove(&Self::lvalue_to_fact(dest));
+        if result_is_critical || fn_id.is_some() {
+            for arg_idx in critical_indices.iter() {
+                Self::operand_to_facts(&arg_ops[*arg_idx]).into_iter().map(|fact| new_pre_facts.insert(fact)).count();
+            }
         }
+        new_pre_facts
+    }
+    fn return_facts(context: &Context<Self::Fact>) -> Vec<Self::Fact> {
+        context.iter().map(|fact| fact.clone()).collect()
+    }
+    fn all_contexts() -> Vec<Context<Self::Fact>> {
+        vec![iter::empty().collect(), iter::once(BaseVar::ReturnPointer).collect()]
     }
 }
 
@@ -181,11 +231,16 @@ pub trait BackwardsAnalysis {
                                 outs: &HashSet<Self::Fact>,
                                 statement: &StatementKind<'tcx>)
                                 -> HashSet<Self::Fact>;
+    fn fn_call_transfer<'mir,'tcx>(crate_info: &CrateInfo<'mir,'tcx>,
+                                        context_and_fn_to_fact_map: &CrateFactsMap<Self::Fact>,
+                                        post_facts: &HashSet<Self::Fact>,
+                                        fn_op: &Operand<'tcx>,
+                                        arg_ops: &Vec<Operand<'tcx>>,
+                                        dest: &Lvalue<'tcx>)
+                                        -> HashSet<Self::Fact>;
     fn join(many: Vec<&HashSet<Self::Fact>>) -> HashSet<Self::Fact>;
-    fn lvalue_to_fact(lvalue: &Lvalue) -> Self::Fact;
-    fn operand_to_facts(op: &Operand) -> Vec<Self::Fact>;
-    fn return_facts() -> Vec<Self::Fact>;
-    fn fact_to_input_idx(fact: Self::Fact) -> Option<usize>;
+    fn return_facts(context: &Context<Self::Fact>) -> Vec<Self::Fact>;
+    fn all_contexts() -> Vec<Context<Self::Fact>>;
     fn flow<'mir,'tcx>(mir_map: &'mir MirMap<'tcx>,
                        tcx: ty::TyCtxt<'mir,'tcx,'tcx>)
                        -> AnalysisState<'mir,'tcx,Self::Fact> {
@@ -193,9 +248,10 @@ pub trait BackwardsAnalysis {
         let mut stable = false;
         while !stable {
             stable = true;
-            for (mir_id, _) in state.mir_map.map.iter() {
-                if Self::flow_mir(*mir_id, &mut state, false) {stable = false;}
-                if Self::flow_mir(*mir_id, &mut state, true) {stable = false;}
+            for (mir_id, _) in state.info.mir_map.map.iter() {
+                for context in Self::all_contexts().into_iter() {
+                    if Self::flow_mir(*mir_id, &mut state, context) {stable = false;}
+                }
             }
         }
         state
@@ -205,11 +261,10 @@ pub trait BackwardsAnalysis {
     /// Returns whether any changes were made.
     fn flow_mir<'mir,'tcx>(mir_id: NodeId,
                            state: &mut AnalysisState<Self::Fact>,
-                           return_is_critical: bool)
+                           context: Context<Self::Fact>)
                            -> bool {
-        let mir = state.mir_map.map.get(&mir_id).unwrap();
-        let mut mir_facts = state.get_crate_facts_map(return_is_critical)
-                                 .remove(&mir_id).unwrap_or(HashMap::new());
+        let mir = state.info.mir_map.map.get(&mir_id).unwrap();
+        let mut mir_facts = state.context_and_fn_to_fact_map.remove(&(context.clone(), mir_id)).unwrap_or(HashMap::new());
 
         let mut any_change = false;
         let mut stable = false;
@@ -224,54 +279,31 @@ pub trait BackwardsAnalysis {
                         let post_idx = StatementIdx(*target, 0);
                         let assignment = StatementKind::Assign(location.clone(),
                                                                Rvalue::Use(value.clone()));
-                        if Self::apply_transfer(mir, state.tcx, &mut mir_facts,
+                        if Self::apply_transfer(&mir, state.info.tcx, &mut mir_facts,
                                                 pre_idx, post_idx, &assignment) {
                             stable = false;
                         }
                     },
                     Call { destination: Some((ref lval, next_bb)), ref func, ref args, .. } => {
-                        let fn_id = state.get_fn_node_id(func);
                         let post_idx = StatementIdx(next_bb, 0);
-                        let result_is_critical = mir_facts.get(&post_idx).unwrap()
-                            .contains(&Self::lvalue_to_fact(lval));
-                        let arg_indices = fn_id.map_or_else(|| {
-                            (0..args.len()).collect::<Vec<_>>()
-                        }, |id| {
-                            let mut func_map = if result_is_critical {
-                                &mut state.crate_fact_maps_critical_return
-                            } else {
-                                &mut state.crate_fact_maps_critical_return
-                            };
-                            let relevant_facts = func_map.entry(id).or_insert(HashMap::new())
-                                .entry(START_STMT).or_insert(HashSet::new());
-                            let mut indices = relevant_facts.iter().filter_map(
-                                |fact| Self::fact_to_input_idx(*fact)
-                            ).collect::<Vec<_>>();
-                            indices.sort();
-                            indices
-                        });
+                        let empty_set: HashSet<Self::Fact> = HashSet::new();
+                        let new_pre_facts =
+                            Self::fn_call_transfer(&state.info,
+                                                   &state.context_and_fn_to_fact_map,
+                                                   mir_facts.get(&post_idx).unwrap_or(&empty_set),
+                                                   func,
+                                                   args,
+                                                   lval);
                         let pre_facts = mir_facts.remove(&pre_idx).unwrap_or(HashSet::new());
-                        let mut new_pre_facts = Self::join(vec![mir_facts.get(&post_idx).unwrap()]);
-                        new_pre_facts.remove(&Self::lvalue_to_fact(lval));
-                        if result_is_critical || fn_id.is_some() {
-                            for arg_idx in arg_indices.iter() {
-                                let arg_facts = Self::operand_to_facts(&args[*arg_idx]);
-                                for fact in arg_facts {
-                                    new_pre_facts.insert(fact);
-                                }
-                            }
-                        }
                         if pre_facts != new_pre_facts { stable = false; }
                         mir_facts.insert(pre_idx, new_pre_facts);
                     },
                     Return => {
                         let pre_facts = mir_facts.entry(pre_idx).or_insert(HashSet::new());
-                        if return_is_critical {
-                            for fact in Self::return_facts() {
-                                if !pre_facts.contains(&fact) {
-                                    stable = false;
-                                    pre_facts.insert(fact);
-                                }
+                        for fact in Self::return_facts(&context) {
+                            if !pre_facts.contains(&fact) {
+                                stable = false;
+                                pre_facts.insert(fact);
                             }
                         }
                     },
@@ -300,7 +332,7 @@ pub trait BackwardsAnalysis {
                 for (s_idx, statement) in basic_block.statements.iter().enumerate().rev() {
                     let post_idx = StatementIdx(bb_idx, s_idx + 1);
                     let pre_idx = StatementIdx(bb_idx, s_idx);
-                    if Self::apply_transfer(mir, state.tcx, &mut mir_facts, pre_idx, post_idx, &statement.kind) {
+                    if Self::apply_transfer(&mir, state.info.tcx, &mut mir_facts, pre_idx, post_idx, &statement.kind) {
                         stable = false;
                     }
                 }
@@ -311,7 +343,7 @@ pub trait BackwardsAnalysis {
             //print!("Escape: {:?} (critical {}):", mir_id, return_is_critical);
             //print_map_lines(&mir_facts);
         }
-        state.get_crate_facts_map(return_is_critical).insert(mir_id, mir_facts);
+        state.context_and_fn_to_fact_map.insert((context, mir_id), mir_facts);
         any_change
     }
 

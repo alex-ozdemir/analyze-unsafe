@@ -19,7 +19,7 @@ use rustc::mir::repr::{Arg,
 use rustc::hir::def_id::DefId;
 use rustc::ty;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub enum BaseVar {
     Var(Var),
     Temp(Temp),
