@@ -353,6 +353,12 @@ impl BackwardsAnalysis for EscapeAnalysis {
         let location = Self::location(dest);
         new_pre_facts.remove(&location);
 
+        if let &Operand::Constant(Constant { literal: Literal::Item{ ref def_id, .. }, .. }) = fn_op {
+            println!("FN Call: {:?}", crate_info.tcx.lookup_item_type(*def_id));
+            println!("FN Call: {:?}", crate_info.tcx.item_path_str(*def_id));
+            println!("FN Call: {:?}", crate_info.tcx.lookup_item_type(*def_id).ty.sty);
+            println!("FN Call: {:?}", def_id.index);
+        }
         let fn_id = crate_info.get_fn_node_id(fn_op);
         let result_is_critical = post_facts.contains(&location);
         let mut call_context = BTreeSet::new();

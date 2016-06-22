@@ -68,6 +68,17 @@ impl FFI {
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Debug, RustcEncodable, RustcDecodable)]
+pub struct Unsafe {
+    unsaf: bool,
+}
+
+impl Unsafe {
+    pub fn new(h: Unsafety) -> Unsafe {
+        Unsafe { unsaf: is_unsafe(h) }
+    }
+}
+
 fn is_unsafe(h: Unsafety) -> bool {
     match h {
         Unsafety::Normal => false,
@@ -78,7 +89,7 @@ fn is_unsafe(h: Unsafety) -> bool {
 #[derive(Clone, PartialEq, Eq, Debug, RustcEncodable, RustcDecodable)]
 pub enum UnsafePoint {
     Deref,
-    Call(FFI),
+    Call(Unsafe,FFI),
     Closure(Box<Block>),
     Block(Box<Block>),
 }
@@ -168,9 +179,10 @@ impl<'a, 'tcx: 'a, 'v> intravisit::Visitor<'v> for UnsafeSummarizer<'a, 'tcx> {
             hir::Expr_::ExprCall(ref fn_expr, _) => {
                 let tys = self.tcx.node_id_to_type(fn_expr.id);
                 if let ty::TyFnDef(_, _,
-                                   &ty::BareFnTy{unsafety: Unsafety::Unsafe, abi, ..}) = tys.sty {
+                                   &ty::BareFnTy{unsafety, abi, ..}) = tys.sty {
                     self.unsafe_points.push(
-                        Indexed::new(self.index, UnsafePoint::Call(FFI::new(abi)))
+                        Indexed::new(self.index,
+                                     UnsafePoint::Call(Unsafe::new(unsafety),FFI::new(abi)))
                     );
                 }
             },
