@@ -107,7 +107,9 @@ impl<Fact: Hash + Eq + Clone> WorkQueue<Fact> {
 
     /// Register that `self_cx` depends on `dep_cx` from basic block `origin`.
     /// This records the dependency so that when the analysis of `dep_cx` changes in the future,
-    /// `self_cx` will be resubmitted to the queue, to be re-analyzed from `origin`
+    /// `self_cx` will be resubmitted to the queue, to be re-analyzed from `origin`.
+    /// It also removes [0 or 1] old dependency of `self_cx` originating at `origin`. This include
+    /// removing that depedency from the graph, and removing that origin from the queue.
     pub fn register_dependency(&mut self,
                                self_cx: &FullCx<Fact>,
                                dep_cx: FullCx<Fact>,
@@ -115,7 +117,10 @@ impl<Fact: Hash + Eq + Clone> WorkQueue<Fact> {
         if !self.entered.contains(&dep_cx) {
             self.enqueue_many(dep_cx.clone(), iter::once(origin))
         }
-        //TODO: Also remove from map?
+        self.map.get_mut(self_cx).map(|flow_source| match flow_source {
+            &mut FlowSource::Blocks(ref mut blocks) => { blocks.remove(&origin); }
+            _ => (),
+        });
         self.deps.remove(&origin, self_cx);
         self.deps.insert(origin, self_cx.clone(), dep_cx);
     }
@@ -130,6 +135,7 @@ impl<Fact: Hash + Eq + Clone> WorkQueue<Fact> {
             self.enqueue_many(dep, origins.into_iter())
         }
     }
+
 
     fn enqueue_many<O: Iterator<Item=BasicBlock>>(&mut self, full_cx: FullCx<Fact>, origins: O) {
         if !self.entered.contains(&full_cx) {
