@@ -12,7 +12,7 @@ pub struct KeyedDepGraph<K,N> {
     map: HashMap<N,HashMap<N,HashSet<K>>>,
 }
 
-impl<K,N> KeyedDepGraph<K,N> where K: Eq + Hash , N: Hash + Eq {
+impl<K,N> KeyedDepGraph<K,N> where K: Eq + Hash + Clone , N: Hash + Eq + Clone {
     /// Create a graph with no registered dependencies
     pub fn new() -> KeyedDepGraph<K,N> {
         KeyedDepGraph {
@@ -44,8 +44,8 @@ impl<K,N> KeyedDepGraph<K,N> where K: Eq + Hash , N: Hash + Eq {
     }
 
     /// Produce an iterator of the dependents of `dependency`, with keys
-    pub fn get_dependents_with_keys<'a>(&'a mut self, dependency: N) -> hash_map::Iter<'a, N, HashSet<K>> {
-        self.map.entry(dependency).or_insert_with(HashMap::new).iter()
+    pub fn get_dependents_with_keys(&mut self, dependency: N) -> hash_map::IntoIter<N, HashSet<K>> {
+        self.map.entry(dependency).or_insert_with(HashMap::new).clone().into_iter()
     }
 
     /// Checks if a certain dependency is still in the graph
