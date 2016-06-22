@@ -5,7 +5,7 @@
 // get_dependents(dependency)
 // remove(key,dependent)
 
-use std::collections::{self, HashSet, HashMap};
+use std::collections::{self, hash_map, HashSet, HashMap};
 use std::hash::Hash;
 
 pub struct KeyedDepGraph<K,N> {
@@ -39,7 +39,20 @@ impl<K,N> KeyedDepGraph<K,N> where K: Eq + Hash , N: Hash + Eq {
     }
 
     /// Produce an iterator of the dependents of `dependency`
-    pub fn get_dependents<'a>(&'a mut self, dependency: N) -> collections::hash_map::Keys<'a, N, collections::HashSet<K>> {
+    pub fn get_dependents<'a>(&'a mut self, dependency: N) -> hash_map::Keys<'a, N, HashSet<K>> {
         self.map.entry(dependency).or_insert_with(HashMap::new).keys()
+    }
+
+    /// Produce an iterator of the dependents of `dependency`, with keys
+    pub fn get_dependents_with_keys<'a>(&'a mut self, dependency: N) -> hash_map::Iter<'a, N, HashSet<K>> {
+        self.map.entry(dependency).or_insert_with(HashMap::new).iter()
+    }
+
+    /// Checks if a certain dependency is still in the graph
+    pub fn exists(&mut self, key: &K, dependent: &N, dependency: &N) -> bool {
+        self.map.get(dependency)
+                .and_then(|deps| deps.get(dependent))
+                .map(|keys| keys.contains(key))
+                .unwrap_or(false)
     }
 }
