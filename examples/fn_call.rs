@@ -20,6 +20,10 @@ fn apply2(f: *const fn(i32) -> i32, i: i32) -> i32 {
     (unsafe {*f})(i)
 }
 
+pub fn bad1 (f: fn(*const i32) -> i32, i: *const i32) -> i32 {
+    f(i)
+}
+
 fn fn_taints(f: fn(*const i32) -> *const i32, i: *const i32) -> i32 {
     let j = f(i);
     unsafe {*j}

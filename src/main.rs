@@ -15,6 +15,7 @@ mod count;
 mod back;
 mod base_var;
 mod dep_graph;
+mod path;
 
 use count::UnsafeData;
 
