@@ -4,6 +4,7 @@
 // entered by a public interface.
 
 use rustc::hir::{self, intravisit};
+use rustc::hir::def_id::DefId;
 use rustc::mir::repr::{BasicBlock,
                        Constant,
                        Literal,
@@ -204,18 +205,24 @@ impl<'mir,'tcx> CrateInfo<'mir,'tcx> {
         }
     }
 
+    /// If this function is static, gets the def'n ID.
+    /// Otherwise returns none.
+    fn get_fn_def_id(&self, func_op: &Operand<'tcx>) -> Option<DefId> {
+        match func_op {
+            &Operand::Constant(Constant{ literal: Literal::Item { def_id, .. }, .. }) =>
+                Some(def_id),
+            _ => None,
+        }
+    }
+
     // If there is MIR for the value of this operand, this functions finds its ID (assuming the
     // operand is just constant).
     fn get_fn_node_id(&self, func_op: &Operand<'tcx>) -> Option<NodeId> {
-        use rustc::mir::repr::{};
-        match func_op {
-            &Operand::Constant(Constant{ literal: Literal::Item { def_id, .. }, .. }) =>
-                self.tcx.map.as_local_node_id(def_id).and_then(|node_id|
-                    if self.mir_map.map.contains_key(&node_id) { Some(node_id) }
-                    else { None }
-                ),
-            _ => None,
-        }
+        self.get_fn_def_id(func_op).and_then(|def_id| self.tcx.map.as_local_node_id(def_id)
+            .and_then(|node_id|
+                if self.mir_map.map.contains_key(&node_id) { Some(node_id) }
+                else { None }
+                ))
     }
 
     fn node_id_to_mir(&self, node_id: &NodeId) -> Option<&'mir Mir<'tcx>> {
@@ -292,7 +299,45 @@ impl EscapeAnalysis {
             _ => None,
         }
     }
+
+    /// Simple heurestic for determining if a function call which uses a raw pointer is concerning.
+    /// We say it is concerning if it is marked as 'unsafe' and takes a raw pointer.
+    fn generate_fn_call<'tcx, 'mir>(mir_id: NodeId,
+                                    crate_info: &CrateInfo<'mir, 'tcx>,
+                                    fn_op: &Operand<'tcx>,
+                                    arg_ops: &Vec<Operand<'tcx>>
+                                    ) -> Vec<BaseVar> {
+        use rustc::ty::TypeVariants::*;
+        let def_id = crate_info.get_fn_def_id(fn_op);
+        let mir = crate_info.mir_map.map.get(&mir_id).unwrap();
+        let is_critical_use = match def_id {
+            Some(def_id) => {
+                if crate_info.get_fn_node_id(fn_op).is_none() {
+                    match crate_info.tcx.lookup_item_type(def_id).ty.sty {
+                        TyFnDef(_, _, ref bare_fn_ty) |
+                        TyFnPtr(ref bare_fn_ty) =>
+                            bare_fn_ty.unsafety == hir::Unsafety::Unsafe,
+                        _ => bug!("Should be a function type!"),
+                    }
+                } else {
+                    false
+                }
+            },
+            None => true,
+        };
+        if is_critical_use {
+            arg_ops.iter().flat_map(|arg_op|
+                match mir.operand_ty(crate_info.tcx, arg_op).sty {
+                    TyRawPtr(_) => operand_used_vars(arg_op).into_iter(),
+                    _ => vec![].into_iter(),
+                }
+            ).collect()
+        } else {
+            vec![]
+        }
+    }
 }
+
 
 impl BackwardsAnalysis for EscapeAnalysis {
     type Fact = BaseVar;
@@ -382,12 +427,17 @@ impl BackwardsAnalysis for EscapeAnalysis {
             }
         }
 
+        // Generate ...
         let mir = crate_info.node_id_to_mir(&mir_id).unwrap();
         for arg_op in arg_ops {
             new_pre_facts.extend(Self::generate(mir, crate_info.tcx, Expr::Operand(arg_op)));
         }
         new_pre_facts.extend(Self::generate(mir, crate_info.tcx, Expr::Operand(fn_op)));
         new_pre_facts.extend(Self::generate(mir, crate_info.tcx, Expr::Lvalue(dest)));
+
+        // Generate from mysterious function call. That is, if we pass raw pointers into some
+        // unsafe unknown function, the argument pass is take to be critical.
+        new_pre_facts.extend(Self::generate_fn_call(mir_id, crate_info, fn_op, arg_ops));
         (fn_id.map(|id| (id, call_context.clone())), new_pre_facts)
     }
     fn return_facts(context: &Context<Self::Fact>) -> HashSet<Self::Fact> {
