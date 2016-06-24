@@ -1,4 +1,4 @@
-#![feature(box_patterns,rustc_private)]
+#![feature(box_syntax,box_patterns,rustc_private)]
 // Alex Ozdemir <aozdemir@hmc.edu>
 // Tool for counting unsafe invocations in an AST
 
@@ -13,13 +13,21 @@ mod summarize;
 mod dataflow;
 mod count;
 mod back;
+//mod backflow;
+mod simple;
+//mod complex;
 mod base_var;
 mod dep_graph;
 mod path;
 
 use count::UnsafeData;
 
-use back::{EscapeAnalysis,BackwardsAnalysis};
+use simple::SimpleEscapeAnalysis;
+
+//use complex::ComplexEscapeAnalysis;
+
+use back::BackwardsAnalysis;
+//use backflow::BackwardsAnalysis;
 
 use rustc_serialize::json;
 
@@ -119,7 +127,7 @@ impl<'a> AnalyzeUnsafe<'a> {
             let hir = state.hir_crate.unwrap();
             let tcx = state.tcx.expect("Type context should exist");
             let mir_map = state.mir_map.expect("We should be in orbit - use `-Z orbit`");
-            let escape_analysis = EscapeAnalysis::flow(mir_map, tcx);
+            let escape_analysis = SimpleEscapeAnalysis::flow(mir_map, tcx);
             escape_analysis.get_lints(analysis, hir).iter().map(|&(span, ref err)|
                 state.session.span_warn(span, err)
             ).count();

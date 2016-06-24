@@ -2,6 +2,8 @@
 //
 // A backwards data-flow analysis for determining when functions are dereferencing unverified types
 // entered by a public interface.
+//
+// This flow tool is for the complex data flow.
 
 use rustc::hir::{self, intravisit};
 use rustc::hir::def_id::DefId;
@@ -227,17 +229,15 @@ pub enum Expr<'a, 'tcx: 'a> {
 }
 
 pub trait BackwardsAnalysis {
-    type Fact: PartialEq + Eq + Hash + Clone + Copy + Debug + PartialOrd + Ord;
+    type Fact: PartialEq + Eq + Hash + Clone + Debug + PartialOrd + Ord;
     // The facts which are made by evaluating this expression. Comes up during some terminators.
-    fn generate<'a, 'tcx, 'mir, 'gcx>(mir: &Mir<'tcx>,
-                                      tcx: ty::TyCtxt<'mir,'gcx,'tcx>,
-                                      expr: Expr<'a, 'tcx>) -> Vec<Self::Fact>;
+    fn generate<'a, 'tcx>(expr: Expr<'a, 'tcx>) -> Vec<Self::Fact>;
+
     // Produces the set of facts before the execution of a statement.
-    fn transfer<'mir,'gcx,'tcx>(mir: &Mir<'tcx>,
-                                tcx: ty::TyCtxt<'mir,'gcx,'tcx>,
-                                post_facts: &HashSet<Self::Fact>,
+    fn transfer<'tcx>(post_facts: &HashSet<Self::Fact>,
                                 statement: &StatementKind<'tcx>)
                                 -> HashSet<Self::Fact>;
+
     // Produces the set of facts before the call of a function
     fn fn_call_transfer<'mir,'tcx>(mir_id: NodeId,
                                    crate_info: &CrateInfo<'mir,'tcx>,
@@ -322,7 +322,7 @@ pub trait BackwardsAnalysis {
                     let post_idx = StatementIdx(*target, 0);
                     let assignment = StatementKind::Assign(location.clone(),
                                                            Rvalue::Use(value.clone()));
-                    if !Self::apply_transfer(&mir, state.info.tcx, &mut mir_facts,
+                    if !Self::apply_transfer(&mut mir_facts,
                                             pre_idx, post_idx, &assignment) {
                         new_flow = false;
                     }
@@ -374,7 +374,7 @@ pub trait BackwardsAnalysis {
                         Self::join(post_facts)
                     };
                     evaluated_expression(other).map(|expr|
-                        new_pre_facts.extend(Self::generate(mir, state.info.tcx, expr))
+                        new_pre_facts.extend(Self::generate(expr))
                     );
                     let change = mir_facts.remove(&pre_idx).map(|pre_facts|
                         pre_facts != new_pre_facts
@@ -388,7 +388,7 @@ pub trait BackwardsAnalysis {
                 for (s_idx, statement) in basic_block.statements.iter().enumerate().rev() {
                     let post_idx = StatementIdx(bb_idx, s_idx + 1);
                     let pre_idx = StatementIdx(bb_idx, s_idx);
-                    if !Self::apply_transfer(&mir, state.info.tcx, &mut mir_facts,
+                    if !Self::apply_transfer(&mut mir_facts,
                                              pre_idx, post_idx, &statement.kind) {
                         new_flow = false;
                         break;
@@ -416,16 +416,14 @@ pub trait BackwardsAnalysis {
     /// Apply the transfer function across this statment, which must lie between the two indices.
     /// Returns whether or not the facts for `pre_idx` actually changed because of the transfer
     /// function, so that the caller can detect when the flow stabilizes.
-    fn apply_transfer<'mir,'gcx,'tcx>(mir: &Mir<'tcx>,
-                                      tcx: ty::TyCtxt<'mir,'gcx,'tcx>,
-                                      mir_facts: &mut MIRFactsMap<Self::Fact>,
+    fn apply_transfer<'mir,'gcx,'tcx>(mir_facts: &mut MIRFactsMap<Self::Fact>,
                                       pre_idx: StatementIdx,
                                       post_idx: StatementIdx,
                                       statement: &StatementKind<'tcx>)
                                       -> bool {
         let new_pre_facts = {
             let post_facts = mir_facts.entry(post_idx).or_insert(HashSet::new());
-            Self::transfer(mir, tcx, post_facts, statement)
+            Self::transfer(post_facts, statement)
         };
         let old_facts = mir_facts.remove(&pre_idx);
         let change = old_facts.as_ref().map_or(true, |facts| *facts != new_pre_facts);
