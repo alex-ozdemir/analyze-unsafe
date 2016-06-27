@@ -61,11 +61,14 @@ fn count_unsafe<'a,'tcx>(krate: &hir::Crate, tcx: ty::TyCtxt<'a,'tcx,'tcx>) -> U
     v.data
 }
 
-fn summarize_unsafe<'a,'tcx>(krate: &hir::Crate, tcx: ty::TyCtxt<'a,'tcx,'tcx>) {
+fn summarize_unsafe<'a,'tcx>(crate_name: &str,
+                             crate_type: String,
+                             krate: &hir::Crate,
+                             tcx: ty::TyCtxt<'a,'tcx,'tcx>) {
     let mut v = summarize::UnsafeSummarizer::new(tcx);
     krate.visit_all_items(&mut v);
-    errln!("JSON:{}", json::as_json(&v.functions));
-    errln!("RUST:{:?}", v.functions);
+    errln!("{{\"name\": {:?}, \"type\":{:?}, \"json\":{}, \"rust\": \"{:?}\"}}",
+           crate_name, crate_type, json::as_json(&v.functions), v.functions);
 }
 
 /// A complier calls structure which behaves like Rustc, less running a callback
@@ -117,7 +120,10 @@ impl<'a> AnalyzeUnsafe<'a> {
         AnalyzeUnsafe::new(Box::new(move |state| {
             let krate = state.hir_crate.expect("HIR should exist");
             let tcx = state.tcx.expect("Type context should exist");
-            summarize_unsafe(krate, tcx);
+            let crate_name = state.crate_name.unwrap_or("????");
+            let crate_type = state.session.opts.crate_types.iter()
+                .next().map(|t| format!("{:?}",t)).unwrap_or("????".to_string());
+            summarize_unsafe(crate_name, crate_type, krate, tcx);
         }))
     }
 
@@ -204,6 +210,6 @@ fn print_map_lines<K: Debug + Eq + Hash, V: Debug>(map: &HashMap<K, V>) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let mut analyzer = AnalyzeUnsafe::dataflow();
+    let mut analyzer = AnalyzeUnsafe::unsafe_ast_emitter();
     rustc_driver::run_compiler(&args, &mut analyzer);
 }
