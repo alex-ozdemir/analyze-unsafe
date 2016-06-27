@@ -1,8 +1,7 @@
 #!/bin/zsh
-PLUGIN=./src/analyze/plugin.zsh
 
+# Set up the list of crates
 filename=crate-list.txt
-
 if [ ! -z "$1" ]; then filename=$1; fi
 
 echo "crate target_type blocks functions methods impls declarations"
@@ -15,7 +14,6 @@ for crate_name in $(cat $filename); do
     fi
     if [[ -a $crate_name ]]; then
         cd "$crate_name"
-        #>&2 echo "Running plugin, ../../$PLUGIN , on $crate_name ... "
         eval rustup run analyze cargo build
         # Remove the final binaryies. We don't use `clean` to avoid rebuilding deps.
         rm target/debug/*(.)
