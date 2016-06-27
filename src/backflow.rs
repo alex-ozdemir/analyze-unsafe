@@ -231,12 +231,16 @@ pub enum Expr<'a, 'tcx: 'a> {
 pub trait BackwardsAnalysis {
     type Fact: PartialEq + Eq + Hash + Clone + Debug + PartialOrd + Ord;
     // The facts which are made by evaluating this expression. Comes up during some terminators.
-    fn generate<'a, 'tcx>(expr: Expr<'a, 'tcx>) -> Vec<Self::Fact>;
+    fn generate<'a, 'tcx, 'mir>(mir_id: NodeId, crate_info: &CrateInfo<'mir,'tcx>,
+                                expr: Expr<'a, 'tcx>) -> Vec<Self::Fact>;
 
     // Produces the set of facts before the execution of a statement.
-    fn transfer<'tcx>(post_facts: &HashSet<Self::Fact>,
-                                statement: &StatementKind<'tcx>)
-                                -> HashSet<Self::Fact>;
+    fn transfer<'mir,'tcx>(mir_id: NodeId,
+                           crate_info: &CrateInfo<'mir,'tcx>,
+                           post_facts: &HashSet<Self::Fact>,
+                           lvalue: &Lvalue<'tcx>,
+                           rvalue: &Rvalue<'tcx>)
+                           -> HashSet<Self::Fact>;
 
     // Produces the set of facts before the call of a function
     fn fn_call_transfer<'mir,'tcx>(mir_id: NodeId,
@@ -322,7 +326,7 @@ pub trait BackwardsAnalysis {
                     let post_idx = StatementIdx(*target, 0);
                     let assignment = StatementKind::Assign(location.clone(),
                                                            Rvalue::Use(value.clone()));
-                    if !Self::apply_transfer(&mut mir_facts,
+                    if !Self::apply_transfer(mir_id, &state.info, &mut mir_facts,
                                             pre_idx, post_idx, &assignment) {
                         new_flow = false;
                     }
@@ -374,7 +378,7 @@ pub trait BackwardsAnalysis {
                         Self::join(post_facts)
                     };
                     evaluated_expression(other).map(|expr|
-                        new_pre_facts.extend(Self::generate(expr))
+                        new_pre_facts.extend(Self::generate(mir_id, &state.info, expr))
                     );
                     let change = mir_facts.remove(&pre_idx).map(|pre_facts|
                         pre_facts != new_pre_facts
@@ -388,7 +392,7 @@ pub trait BackwardsAnalysis {
                 for (s_idx, statement) in basic_block.statements.iter().enumerate().rev() {
                     let post_idx = StatementIdx(bb_idx, s_idx + 1);
                     let pre_idx = StatementIdx(bb_idx, s_idx);
-                    if !Self::apply_transfer(&mut mir_facts,
+                    if !Self::apply_transfer(mir_id, &state.info, &mut mir_facts,
                                              pre_idx, post_idx, &statement.kind) {
                         new_flow = false;
                         break;
@@ -416,14 +420,17 @@ pub trait BackwardsAnalysis {
     /// Apply the transfer function across this statment, which must lie between the two indices.
     /// Returns whether or not the facts for `pre_idx` actually changed because of the transfer
     /// function, so that the caller can detect when the flow stabilizes.
-    fn apply_transfer<'mir,'gcx,'tcx>(mir_facts: &mut MIRFactsMap<Self::Fact>,
+    fn apply_transfer<'mir,'gcx,'tcx>(mir_id: NodeId,
+                                      crate_info: &CrateInfo<'mir,'tcx>,
+                                      mir_facts: &mut MIRFactsMap<Self::Fact>,
                                       pre_idx: StatementIdx,
                                       post_idx: StatementIdx,
                                       statement: &StatementKind<'tcx>)
                                       -> bool {
         let new_pre_facts = {
             let post_facts = mir_facts.entry(post_idx).or_insert(HashSet::new());
-            Self::transfer(post_facts, statement)
+            let &StatementKind::Assign(ref lval, ref rval) = statement;
+            Self::transfer(mir_id, crate_info, post_facts, lval, rval)
         };
         let old_facts = mir_facts.remove(&pre_idx);
         let change = old_facts.as_ref().map_or(true, |facts| *facts != new_pre_facts);

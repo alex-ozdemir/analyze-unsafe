@@ -8,7 +8,9 @@ pub struct Point {
 }
 
 pub fn bad10(p: (*const i32, *const i32)) -> i32 {
-    unsafe { *(p.0) }
+    let out = unsafe { *(p.0) };
+    let q = p;
+    out
 }
 
 pub fn bad20(p: Pair) -> i32 {
@@ -17,6 +19,11 @@ pub fn bad20(p: Pair) -> i32 {
 
 pub fn bad30(p: Point) -> i32 {
     unsafe { *(p.x) }
+}
+
+pub fn mk_vec() {
+    let v = vec![3, 4, 5];
+    let y = v[0];
 }
 
 fn main(){ }

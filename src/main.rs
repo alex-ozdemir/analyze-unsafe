@@ -13,9 +13,9 @@ mod summarize;
 mod dataflow;
 mod count;
 mod back;
-//mod backflow;
+mod backflow;
 mod simple;
-//mod complex;
+mod complex;
 mod base_var;
 mod dep_graph;
 mod path;
@@ -24,10 +24,10 @@ use count::UnsafeData;
 
 use simple::SimpleEscapeAnalysis;
 
-//use complex::ComplexEscapeAnalysis;
+use complex::ComplexEscapeAnalysis;
 
-use back::BackwardsAnalysis;
-//use backflow::BackwardsAnalysis;
+//use back::BackwardsAnalysis;
+use backflow::BackwardsAnalysis;
 
 use rustc_serialize::json;
 
@@ -127,7 +127,11 @@ impl<'a> AnalyzeUnsafe<'a> {
             let hir = state.hir_crate.unwrap();
             let tcx = state.tcx.expect("Type context should exist");
             let mir_map = state.mir_map.expect("We should be in orbit - use `-Z orbit`");
-            let escape_analysis = SimpleEscapeAnalysis::flow(mir_map, tcx);
+            let escape_analysis = ComplexEscapeAnalysis::flow(mir_map, tcx);
+            for (au, map) in escape_analysis.context_and_fn_to_fact_map.iter() {
+                print!("{:?} ", au);
+                print_map_lines(map);
+            }
             escape_analysis.get_lints(analysis, hir).iter().map(|&(span, ref err)|
                 state.session.span_warn(span, err)
             ).count();
