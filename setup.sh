@@ -1,11 +1,10 @@
 #!/usr/bin/zsh
 
 main () {
-    ensure sudo yum -y install gcc48
-    ensure sudo yum -y install cmake
-    ensure sudo yum -y install openssl-devel
-    
+
     ensure curl https://sh.rustup.rs -sSf | sh -s -- --default-toolchain nightly -y
+
+    ensure cargo install cargo-clone
 
     ensure source ~/.profile
 
