@@ -1,26 +1,45 @@
 #!/bin/sh
 
-# Set up the list of crates
-filename=crate-list.txt
-if [ ! -z "$1" ]; then filename=$1; fi
+main() {
+    # Set up the list of crates
+    filename=crate-list.txt
+    cargos=8
+    procs_per_cargo=4
+    if [ ! -z "$1" ]; then filename=$1; fi
+    
+    echo "crate target_type blocks functions methods impls declarations"
+    
+    source ~/.profile
 
-echo "crate target_type blocks functions methods impls declarations"
-
-mkdir -p sources
-
-for crate_name in $(cat $filename); do
-    cd sources
-    if [[ ! -a "$crate_name" ]]; then
-        #>&2 echo "Cloning into $crate_name ... "
-        eval cargo clone $crate_name 2> /dev/null > /dev/null
+    need_cmd cargo
+    
+    if [ ! -e sources ]; then
+        mkdir -p sources/.cargo
+        echo "[build]
+jobs = $procs_per_cargo" > sources/.cargo/config
     fi
-    if [[ -a $crate_name ]]; then
-        cd "$crate_name"
-        eval rustup run analyze cargo build
-        # Remove the final binaryies. We don't use `clean` to avoid rebuilding deps.
-        eval rustup run analyze cargo clean
-        cd ..
-    fi
-    cd ..
-done;
+    
+    cat $filename | xargs -n 1 --max-procs="$cargos" sh analyze-crate.sh
+}
 
+
+say() {
+    echo "rustup: $1"
+}
+
+say_err() {
+    say "$1" >&2
+}
+
+err() {
+    say "$1" >&2
+    exit 1
+}
+
+need_cmd() {
+    if ! command -v "$1" > /dev/null 2>&1
+    then err "need '$1' (command not found)"
+    fi
+}
+
+main "$@" 

@@ -4,9 +4,9 @@ main () {
 
     ensure curl https://sh.rustup.rs -sSf | sh -s -- --default-toolchain nightly -y
 
-    ensure cargo install cargo-clone
-
     ensure source ~/.profile
+
+    ensure cargo install cargo-clone
 
     toolchain_name=$(ls ~/.multirust/toolchains | grep nightly | head -n 1)
 
