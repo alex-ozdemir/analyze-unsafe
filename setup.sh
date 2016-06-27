@@ -1,17 +1,25 @@
 #!/usr/bin/zsh
 
 main () {
+    ensure sudo yum -y install gcc48
+    ensure sudo yum -y install cmake
+    ensure sudo yum -y install openssl-devel
+    
     ensure curl https://sh.rustup.rs -sSf | sh -s -- --default-toolchain nightly -y
 
-    toolchain_name=$(ensure ls ~/.multirust/toolchains | grep nightly | head -n 1)
+    ensure source ~/.profile
+
+    toolchain_name=$(ls ~/.multirust/toolchains | grep nightly | head -n 1)
+
+    assert_nz "$toolchain_name"
 
     ensure cargo build --release
 
-    ensure mkdir bin
+    ensure mkdir -p bin
 
     ensure cp ./target/release/analyze ./bin/rustc
 
-    ensure ln -s "~/.multirust/toolchains/$toolchain_name/lib" ./lib
+    ensure ln -s "$HOME/.multirust/toolchains/$toolchain_name/lib" lib
 
     ensure rustup toolchain link analyze .
 }
@@ -67,3 +75,5 @@ run() {
     fi
     return $_retval
 }
+
+run main
