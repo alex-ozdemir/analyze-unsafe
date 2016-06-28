@@ -9,9 +9,9 @@ main () {
     fi
     if [[ -a $crate_name ]]; then
         cd "$crate_name"
-        eval rustup run analyze cargo build
+        eval rustup run analyze cargo build --verbose
         # Remove the final binaryies. We don't use `clean` to avoid rebuilding deps.
-        eval rustup run analyze cargo clean
+        eval rustup run analyze cargo clean --verbose
         cd ..
     fi
     cd ..
