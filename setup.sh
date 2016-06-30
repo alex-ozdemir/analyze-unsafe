@@ -16,6 +16,8 @@ main () {
 
     ensure mkdir -p bin
 
+    ensure mkdir -p output
+
     ensure cp ./target/release/analyze ./bin/rustc
 
     ensure ln -s "$HOME/.multirust/toolchains/$toolchain_name/lib" lib
