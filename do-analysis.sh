@@ -3,11 +3,9 @@
 main() {
     # Set up the list of crates
     filename=crate-list.txt
-    cargos=9
-    procs_per_cargo=4
+    cargos=12
+    procs_per_cargo=3
     if [ ! -z "$1" ]; then filename=$1; fi
-    
-    echo "crate target_type blocks functions methods impls declarations"
     
     source ~/.profile
 
