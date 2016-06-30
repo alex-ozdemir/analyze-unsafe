@@ -6,7 +6,7 @@ main () {
 
     ensure source ~/.profile
 
-    ensure cargo install -f cargo-clone
+    cargo install cargo-clone
 
     toolchain_name=$(ls ~/.multirust/toolchains | grep nightly | head -n 1)
 
