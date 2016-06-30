@@ -61,14 +61,19 @@ fn count_unsafe<'a,'tcx>(krate: &hir::Crate, tcx: ty::TyCtxt<'a,'tcx,'tcx>) -> U
     v.data
 }
 
-fn summarize_unsafe<'a,'tcx>(crate_name: &str,
-                             crate_type: String,
-                             krate: &hir::Crate,
-                             tcx: ty::TyCtxt<'a,'tcx,'tcx>) {
-    let mut v = summarize::UnsafeSummarizer::new(tcx);
-    krate.visit_all_items(&mut v);
-    errln!("{{\"name\": {:?}, \"type\":{:?}, \"json\":{}, \"rust\": \"{:?}\"}}",
-           crate_name, crate_type, json::as_json(&v.functions), v.functions);
+fn summarize_unsafe<'a,'tcx,'ast>(crate_name: &str,
+                                  crate_type: String,
+                                  krate: &hir::Crate,
+                                  session: &'ast Session,
+                                  tcx: ty::TyCtxt<'a,'tcx,'tcx>) {
+    // Hack to prevent dumping results from dependency builds.
+    // Cargo calls these "build_script_build" for some reason.
+    if crate_name != "build_script_build" {
+        let mut v = summarize::UnsafeSummarizer::new(tcx, session);
+        krate.visit_all_items(&mut v);
+        errln!("{{\"name\": {:?}, \"type\":{:?}, \"json\":{} }}",
+               crate_name, crate_type, json::as_json(&v.functions));
+    }
 }
 
 /// A complier calls structure which behaves like Rustc, less running a callback
@@ -120,10 +125,11 @@ impl<'a> AnalyzeUnsafe<'a> {
         AnalyzeUnsafe::new(Box::new(move |state| {
             let krate = state.hir_crate.expect("HIR should exist");
             let tcx = state.tcx.expect("Type context should exist");
+            let session = state.session;
             let crate_name = state.crate_name.unwrap_or("????");
             let crate_type = state.session.opts.crate_types.iter()
                 .next().map(|t| format!("{:?}",t)).unwrap_or("????".to_string());
-            summarize_unsafe(crate_name, crate_type, krate, tcx);
+            summarize_unsafe(crate_name, crate_type, krate, session, tcx);
         }))
     }
 

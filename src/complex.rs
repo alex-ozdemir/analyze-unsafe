@@ -145,8 +145,10 @@ impl BackwardsAnalysis for ComplexEscapeAnalysis {
                 }).count();
 
                 // Verify that the fn_op didn't produce any facts, nor did the ret_ptr
-                assert_eq!(0, Self::generate(mir_id, crate_info, Expr::Operand(fn_op)).len());
-                assert_eq!(0, Self::generate(mir_id, crate_info, Expr::Rvalue(&ret_ptr)).len());
+                debug_assert_eq!(0,
+                                 Self::generate(mir_id, crate_info, Expr::Operand(fn_op)).len());
+                debug_assert_eq!(0,
+                                 Self::generate(mir_id, crate_info, Expr::Rvalue(&ret_ptr)).len());
 
                 (Some(callee_analysis_unit), new_pre_facts)
             }
