@@ -3,6 +3,7 @@
 
 use rustc::hir;
 use rustc::hir::{intravisit,Unsafety};
+use rustc::hir::def::Def;
 use rustc::session::Session;
 use rustc::ty;
 use syntax::{abi,ast};
@@ -130,6 +131,8 @@ fn is_unsafe(h: Unsafety) -> bool {
 #[derive(Clone, PartialEq, Eq, Debug, RustcEncodable, RustcDecodable)]
 pub enum UnsafePoint {
     Deref,
+    MutStatic,
+    InlineASM,
     Call(Unsafe,FFI),
     Closure(Box<Block>),
     Block(Box<Block>),
@@ -159,9 +162,12 @@ impl<'a,'tcx:'a,'ast> UnsafeSummarizer<'a,'tcx,'ast> {
     ///     `index` - its statement number in the enclosing block
     ///     `span` - span of the item
     ///     `snippet` - whether or not to include a code snippet
-    pub fn mk_indexed<T>(&self, index: u64, item: T, span: Span, snippet: bool) -> Indexed<T> {
+    /// and store it in the list of registered unsafe points.
+    pub fn register_point(&mut self, item: UnsafePoint, span: Span, snippet: bool) {
         let macro_origin = self.get_macro_origin(span);
-        Indexed::new(index, item, span, self.session.codemap(), snippet, macro_origin)
+        self.unsafe_points.push(
+            Indexed::new(self.index, item, span, self.session.codemap(), snippet, macro_origin)
+        )
     }
 
     /// Returns true if this `expn_info` was expanded by any macro.
@@ -221,8 +227,7 @@ impl<'a, 'tcx: 'a, 'ast> UnsafeSummarizer<'a, 'tcx, 'ast> {
             Box::new(Block::new(unsafety, self.index, unsafe_points))
         );
         self.index = index;
-        let indexed_pt = self.mk_indexed(self.index, block, b.span, false);
-        self.unsafe_points.push(indexed_pt);
+        self.register_point(block, b.span, false);
     }
     fn visit_fn_post<'v>(&mut self,
                          fk: intravisit::FnKind<'v>,
@@ -244,8 +249,7 @@ impl<'a, 'tcx: 'a, 'ast> UnsafeSummarizer<'a, 'tcx, 'ast> {
                 }
                 Closure(_) => {
                     let closure = UnsafePoint::Closure(boxed_block);
-                    let indexed_pt = self.mk_indexed(self.index, closure, span, false);
-                    self.unsafe_points.push(indexed_pt);
+                    self.register_point(closure, span, false);
                 }
             };
         } else {
@@ -272,32 +276,30 @@ impl<'a, 'tcx: 'a, 'ast, 'v> intravisit::Visitor<'v> for UnsafeSummarizer<'a, 't
                 let fn_ty = self.tcx.expr_ty_adjusted(fn_expr);
                 let fn_safety = get_fn_safety(fn_ty);
                 let fn_ffi = get_fn_ffi(fn_ty);
-//                if self.in_closure && fn_safety.unsaf.clone() {
-//                    self.session.span_warn(expr.span, "Unsafe Call in closure");
-//                }
                 let unsafe_call = UnsafePoint::Call(fn_safety,fn_ffi);
-                let indexed_pt = self.mk_indexed(self.index, unsafe_call, expr.span, true);
-                self.unsafe_points.push(indexed_pt);
+                self.register_point(unsafe_call, expr.span, true);
             },
             hir::Expr_::ExprMethodCall(_, _, _) => {
                 let method_call = ty::MethodCall::expr(expr.id);
                 let fn_ty = self.tcx.tables.borrow().method_map[&method_call].ty;
                 let fn_safety = get_fn_safety(fn_ty);
                 let fn_ffi = get_fn_ffi(fn_ty);
-//                if self.in_closure && fn_safety.unsaf.clone() {
-//                    self.session.span_warn(expr.span, "Unsafe Call in closure");
-//                }
                 let unsafe_call = UnsafePoint::Call(fn_safety,fn_ffi);
-                let indexed_pt = self.mk_indexed(self.index, unsafe_call, expr.span, true);
-                self.unsafe_points.push(indexed_pt);
+                self.register_point(unsafe_call, expr.span, true);
             },
             hir::Expr_::ExprUnary(hir::UnOp::UnDeref, ref sub_expr) => {
                 let tys = self.tcx.node_id_to_type(sub_expr.id);
                 if let ty::TyRawPtr(_) = tys.sty {
-                    let indexed_pt =
-                        self.mk_indexed(self.index, UnsafePoint::Deref, expr.span, true);
-                    self.unsafe_points.push(indexed_pt);
+                    self.register_point(UnsafePoint::Deref, expr.span, true);
                     let in_macro = self.session.codemap().with_expn_info(expr.span.expn_id, |i| i.is_some());
+                }
+            },
+            hir::ExprInlineAsm(..) => {
+                self.register_point(UnsafePoint::InlineASM, expr.span, false);
+            },
+            hir::ExprPath(..) => {
+                if let Def::Static(_, true) = self.tcx.expect_def(expr.id) {
+                    self.register_point(UnsafePoint::MutStatic, expr.span, true);
                 }
             },
             _ => { /* No other unsafe operations */ },
