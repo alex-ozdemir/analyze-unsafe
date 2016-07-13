@@ -6,10 +6,10 @@ extern crate getopts;
 extern crate syntax;
 #[macro_use] extern crate rustc;
 extern crate rustc_driver;
+extern crate rustc_errors;
 extern crate rustc_serialize;
 extern crate rustc_data_structures;
 
-mod summarize;
 mod dataflow;
 mod count;
 mod back;
@@ -19,6 +19,7 @@ mod complex;
 mod base_var;
 mod dep_graph;
 mod path;
+mod transfer;
 
 use count::UnsafeData;
 
@@ -59,21 +60,6 @@ fn count_unsafe<'a,'tcx>(krate: &hir::Crate, tcx: ty::TyCtxt<'a,'tcx,'tcx>) -> U
     let mut v = count::UnsafeCounter::new(tcx, krate);
     intravisit::walk_crate(&mut v, krate);
     v.data
-}
-
-fn summarize_unsafe<'a,'tcx,'ast>(crate_name: &str,
-                                  crate_type: String,
-                                  krate: &hir::Crate,
-                                  session: &'ast Session,
-                                  tcx: ty::TyCtxt<'a,'tcx,'tcx>) {
-    // Hack to prevent dumping results from dependency builds.
-    // Cargo calls these "build_script_build" for some reason.
-    if crate_name != "build_script_build" {
-        let mut v = summarize::UnsafeSummarizer::new(tcx, session);
-        krate.visit_all_items(&mut v);
-        errln!("{{\"name\": {:?}, \"type\":{:?}, \"json\":{} }}",
-               crate_name, crate_type, json::as_json(&v.functions));
-    }
 }
 
 /// A complier calls structure which behaves like Rustc, less running a callback
@@ -121,33 +107,22 @@ impl<'a> AnalyzeUnsafe<'a> {
         }))
     }
 
-    pub fn unsafe_ast_emitter() -> AnalyzeUnsafe<'a> {
-        AnalyzeUnsafe::new(Box::new(move |state| {
-            let krate = state.hir_crate.expect("HIR should exist");
-            let tcx = state.tcx.expect("Type context should exist");
-            let session = state.session;
-            let crate_name = state.crate_name.unwrap_or("????");
-            let crate_type = state.session.opts.crate_types.iter()
-                .next().map(|t| format!("{:?}",t)).unwrap_or("????".to_string());
-            summarize_unsafe(crate_name, crate_type, krate, session, tcx);
-        }))
-    }
-
     pub fn dataflow() -> AnalyzeUnsafe<'a> {
-        AnalyzeUnsafe::new(Box::new(move |state| {
-            let analysis = state.analysis.unwrap();
-            let hir = state.hir_crate.unwrap();
-            let tcx = state.tcx.expect("Type context should exist");
-            let mir_map = state.mir_map.expect("We should be in orbit - use `-Z orbit`");
-            let escape_analysis = ComplexEscapeAnalysis::flow(mir_map, tcx);
-            for (au, map) in escape_analysis.context_and_fn_to_fact_map.iter() {
-                print!("{:?} ", au);
-                print_map_lines(map);
-            }
-            escape_analysis.get_lints(analysis, hir).iter().map(|&(span, ref err)|
-                state.session.span_warn(span, err)
-            ).count();
-        }))
+        unimplemented!()
+//        AnalyzeUnsafe::new(Box::new(move |state| {
+//            let analysis = state.analysis.unwrap();
+//            let hir = state.hir_crate.unwrap();
+//            let tcx = state.tcx.expect("Type context should exist");
+//            let mir_map = state.mir_map.expect("We should be in orbit - use `-Z orbit`");
+//            let escape_analysis = ComplexEscapeAnalysis::flow(mir_map, tcx);
+//            for (au, map) in escape_analysis.context_and_fn_to_fact_map.iter() {
+//                print!("{:?} ", au);
+//                print_map_lines(map);
+//            }
+//            escape_analysis.get_lints(analysis, hir).iter().map(|&(span, ref err)|
+//                state.session.span_warn(span, err)
+//            ).count();
+//        }))
     }
 }
 
@@ -155,7 +130,7 @@ impl<'a,'callback: 'a> CompilerCalls<'a> for AnalyzeUnsafe<'callback> {
     fn early_callback(&mut self,
                       matches: &getopts::Matches,
                       sopts: &config::Options,
-                      descriptions: &diagnostics::registry::Registry,
+                      descriptions: &rustc_errors::registry::Registry,
                       output: config::ErrorOutputType)
                       -> Compilation {
         self.default.early_callback(matches, sopts, descriptions, output)
@@ -166,7 +141,7 @@ impl<'a,'callback: 'a> CompilerCalls<'a> for AnalyzeUnsafe<'callback> {
                 sopts: &config::Options,
                 odir: &Option<PathBuf>,
                 ofile: &Option<PathBuf>,
-                descriptions: &diagnostics::registry::Registry)
+                descriptions: &rustc_errors::registry::Registry)
                 -> Option<(config::Input, Option<PathBuf>)> {
         self.default.no_input(matches, sopts, odir, ofile, descriptions)
     }
@@ -219,7 +194,8 @@ fn print_map_lines<K: Debug + Eq + Hash, V: Debug>(map: &HashMap<K, V>) {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let mut analyzer = AnalyzeUnsafe::unsafe_ast_emitter();
-    rustc_driver::run_compiler(&args, &mut analyzer);
+    unimplemented!()
+//    let args: Vec<String> = std::env::args().collect();
+//    let mut analyzer = AnalyzeUnsafe::dataflow();
+//    rustc_driver::run_compiler(&args, &mut analyzer);
 }
