@@ -17,11 +17,14 @@ use rustc::mir::repr::{BasicBlock,
                        START_BLOCK,
                        StatementKind,
                        TerminatorKind,
+                       Var,
 };
+
+use rustc_data_structures::indexed_vec::Idx;
 
 use rustc::mir::traversal;
 use rustc::mir::mir_map::MirMap;
-use rustc::ty;
+use rustc::ty::{self,TyCtxt,TypeVariants};
 
 use dep_graph::KeyedDepGraph;
 
@@ -33,6 +36,8 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::iter::{self,IntoIterator};
 
+use path::PathRef;
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 // A unique index for each statement in a MIR. First, the basic block, then the position of the
 // statment in the basic block. Often this is used to refer to positions between statements, in
@@ -41,9 +46,50 @@ pub struct StatementIdx(BasicBlock,usize);
 
 pub const START_STMT: StatementIdx = StatementIdx(START_BLOCK, 0);
 
-pub type Context<Fact> = BTreeSet<Fact>;
-pub type MIRFactsMap<Fact> = HashMap<StatementIdx,HashSet<Fact>>;
-pub type CrateFactsMap<Fact> = HashMap<FullCx<Fact>,MIRFactsMap<Fact>>;
+pub type Context<Facts> = Facts;
+pub type MIRFactsMap<Facts> = HashMap<StatementIdx,Facts>;
+pub type CrateFactsMap<Facts> = HashMap<AnalysisUnit<Facts>,MIRFactsMap<Facts>>;
+
+#[derive(Clone, Copy)]
+pub struct MIRInfo<'a, 'mir, 'gcx: 'tcx, 'tcx: 'mir + 'a>{
+    mir: &'a Mir<'tcx>,
+    tcx: TyCtxt<'mir, 'gcx, 'tcx>
+}
+
+impl<'a, 'mir, 'gcx, 'tcx> MIRInfo<'a, 'mir, 'gcx, 'tcx> {
+    pub fn lvalue_ty(&self, lvalue: &Lvalue<'tcx>) -> &TypeVariants<'tcx> {
+        &self.mir.lvalue_ty(self.tcx, lvalue).to_ty(self.tcx).sty
+    }
+
+    pub fn is_raw_ptr(&self, lvalue: &Lvalue<'tcx>) -> bool {
+        if let &TypeVariants::TyRawPtr(_) = self.lvalue_ty(lvalue) {
+            true
+        } else { false }
+    }
+
+    pub fn is_ref(&self, lvalue: &Lvalue<'tcx>) -> bool {
+        if let &TypeVariants::TyRef(_,_) = self.lvalue_ty(lvalue) {
+            true
+        } else { false }
+    }
+
+    #[allow(unused_variables)]
+    pub fn singular(&self, p1: PathRef) -> bool { true }
+
+    #[allow(unused_variables)]
+    pub fn must_alias(&self, p1: PathRef, p2: PathRef) -> bool { false }
+
+    #[allow(unused_variables)]
+    pub fn may_alias(&self, p1: PathRef, p2: PathRef) -> bool { false }
+
+    #[allow(unused_variables)]
+    pub fn may_reach(&self, p1: PathRef, p2: PathRef) -> bool { false }
+
+    pub fn fresh_var(&self) -> Var {
+        Var::new(self.mir.var_decls.len())
+    }
+}
+
 
 pub struct CrateInfo<'mir,'tcx:'mir> {
     // The MIRs for the crate
@@ -53,14 +99,21 @@ pub struct CrateInfo<'mir,'tcx:'mir> {
     pub tcx: ty::TyCtxt<'mir,'tcx,'tcx>,
 }
 
-pub type FullCx<Fact> = (NodeId, Context<Fact>);
+impl<'mir, 'tcx> CrateInfo<'mir, 'tcx> {
+    pub fn get_mir_info(&self, mir_id: &NodeId) -> MIRInfo<'mir, 'mir, 'tcx, 'tcx> {
+        let mir = self.mir_map.map.get(mir_id).expect("CrateInfo created for an invalid MIRID");
+        MIRInfo{ mir: mir, tcx: self.tcx.clone() }
+    }
+}
 
-pub struct AnalysisState<'mir,'tcx:'mir,Fact> {
+pub type AnalysisUnit<Facts> = (NodeId, Context<Facts>);
+
+pub struct AnalysisState<'mir,'tcx:'mir,Facts> {
     // Holds the fact map for each MIR, in each context
-    pub context_and_fn_to_fact_map: CrateFactsMap<Fact>,
+    pub context_and_fn_to_fact_map: CrateFactsMap<Facts>,
 
     // The work queue, which also manages inter-function dependencies.
-    pub queue: WorkQueue<Fact>,
+    pub queue: WorkQueue<Facts>,
 
     // Info about the crate, independent of the analysis
     pub info: CrateInfo<'mir,'tcx>,
@@ -68,33 +121,33 @@ pub struct AnalysisState<'mir,'tcx:'mir,Fact> {
 
 /// The WorkQueue data structure not only provides a queue of analyses (MIR,CX) to run, it also
 /// store inter-analysis depedencies, and enqeue analyses appropriatedly.
-pub struct WorkQueue<Fact> {
+pub struct WorkQueue<Facts> {
 
     /// The data structure which stores all dependencies.
-    deps: KeyedDepGraph<BasicBlock,FullCx<Fact>>,
+    deps: KeyedDepGraph<BasicBlock,AnalysisUnit<Facts>>,
 
     /// The queue of analyses to re-run.
-    queue: VecDeque<FullCx<Fact>>,
+    queue: VecDeque<AnalysisUnit<Facts>>,
 
     /// A map of where analyses in the queue need to be re-run from.
-    map: HashMap<FullCx<Fact>,FlowSource>,
+    map: HashMap<AnalysisUnit<Facts>,FlowSource>,
 
     /// A set of all things that have been enqueue. Relevant because the first time something is
     /// entered it's flow source should be all returns.
-    entered: HashSet<FullCx<Fact>>,
+    entered: HashSet<AnalysisUnit<Facts>>,
 }
 
 
-impl<Fact: Hash + Eq + Clone> WorkQueue<Fact> {
+impl<Facts: Hash + Eq + Clone> WorkQueue<Facts> {
 
-    pub fn new<I: Iterator<Item=FullCx<Fact>>>(iter: I) -> WorkQueue<Fact> {
+    pub fn new<I: Iterator<Item=AnalysisUnit<Facts>>>(iter: I) -> WorkQueue<Facts> {
         let mut q = WorkQueue {
             deps: KeyedDepGraph::new(),
             queue: VecDeque::new(),
             map: HashMap::new(),
             entered: HashSet::new(),
         };
-        iter.map(|full_cx| q.enqueue_many(full_cx, iter::once(START_BLOCK))).count();
+        iter.map(|au| q.enqueue_many(au, iter::once(START_BLOCK))).count();
         q
     }
 
@@ -104,8 +157,8 @@ impl<Fact: Hash + Eq + Clone> WorkQueue<Fact> {
     /// It also removes [0 or 1] old dependency of `self_cx` originating at `origin`. This include
     /// removing that depedency from the graph, and removing that origin from the queue.
     pub fn register_dependency(&mut self,
-                               self_cx: &FullCx<Fact>,
-                               dep_cx: FullCx<Fact>,
+                               self_cx: &AnalysisUnit<Facts>,
+                               dep_cx: AnalysisUnit<Facts>,
                                origin: BasicBlock) {
         if !self.entered.contains(&dep_cx) {
             self.enqueue_many(dep_cx.clone(), iter::once(origin))
@@ -123,22 +176,22 @@ impl<Fact: Hash + Eq + Clone> WorkQueue<Fact> {
     /// the dependent's dependency originates. The queue will also never have duplicate full
     /// contexts.
     pub fn enqueue_dependents(&mut self,
-                              self_cx: &FullCx<Fact>) {
+                              self_cx: &AnalysisUnit<Facts>) {
         for (dep, origins) in self.deps.get_dependents_with_keys(self_cx.clone()) {
             self.enqueue_many(dep, origins.into_iter())
         }
     }
 
 
-    fn enqueue_many<O: Iterator<Item=BasicBlock>>(&mut self, full_cx: FullCx<Fact>, origins: O) {
-        if !self.entered.contains(&full_cx) {
-            self.map.insert(full_cx.clone(), FlowSource::Returns);
-            self.queue.push_back(full_cx.clone());
-            self.entered.insert(full_cx);
+    fn enqueue_many<O: Iterator<Item=BasicBlock>>(&mut self, au: AnalysisUnit<Facts>, origins: O) {
+        if !self.entered.contains(&au) {
+            self.map.insert(au.clone(), FlowSource::Returns);
+            self.queue.push_back(au.clone());
+            self.entered.insert(au);
         }
         else {
-            if self.map.contains_key(&full_cx) {
-                match self.map.get_mut(&full_cx).unwrap() {
+            if self.map.contains_key(&au) {
+                match self.map.get_mut(&au).unwrap() {
                     &mut FlowSource::Blocks(ref mut blocks) => {
                         origins.map(|bb| blocks.insert(bb.clone())).count();
                     },
@@ -148,17 +201,17 @@ impl<Fact: Hash + Eq + Clone> WorkQueue<Fact> {
             } else {
                 let mut set = HashSet::new();
                 origins.map(|bb| set.insert(bb.clone())).count();
-                self.map.insert(full_cx.clone(), FlowSource::Blocks(set));
-                self.queue.push_back(full_cx);
+                self.map.insert(au.clone(), FlowSource::Blocks(set));
+                self.queue.push_back(au);
             }
         }
     }
 
-    pub fn get(&mut self) -> Option<WorkItem<Fact>> {
-        self.queue.pop_front().map( |full_cx| {
-            let source = self.map.remove(&full_cx).unwrap();
+    pub fn get(&mut self) -> Option<WorkItem<Facts>> {
+        self.queue.pop_back().map( |au| {
+            let source = self.map.remove(&au).unwrap();
             // TODO. Make sure that the dependency still exists!
-            WorkItem(full_cx.0, full_cx.1, source)
+            WorkItem(au.0, au.1, source)
         })
     }
 }
@@ -167,7 +220,7 @@ impl<Fact: Hash + Eq + Clone> WorkQueue<Fact> {
 ///
 /// The NodeId indicate which MIR, the Context indicates which facts should hold at returns, and
 /// the FlowSource indicates where the flow should begin within the MIR.
-pub struct WorkItem<Fact>(NodeId, Context<Fact>, FlowSource);
+pub struct WorkItem<Facts>(NodeId, Context<Facts>, FlowSource);
 
 /// Where flow should begin in an MIR.
 ///
@@ -177,13 +230,13 @@ pub enum FlowSource {
     Blocks(HashSet<BasicBlock>),
 }
 
-impl<'mir,'tcx, Fact: Eq + Hash + Ord + Clone> AnalysisState<'mir,'tcx,Fact> {
+impl<'mir,'tcx, Facts: Eq + Hash + Ord + Default + Clone> AnalysisState<'mir,'tcx,Facts> {
     fn new(mir_map: &'mir MirMap<'tcx>, tcx: ty::TyCtxt<'mir,'tcx,'tcx>)
-           -> AnalysisState<'mir,'tcx,Fact> {
+           -> AnalysisState<'mir,'tcx,Facts> {
         AnalysisState {
             context_and_fn_to_fact_map: HashMap::new(),
             info: CrateInfo::new(mir_map, tcx),
-            queue: WorkQueue::new(mir_map.map.keys().map(|id| (*id, BTreeSet::new()))),
+            queue: WorkQueue::new(mir_map.map.keys().map(|id| (*id, Facts::default()))),
         }
     }
 }
@@ -229,34 +282,27 @@ pub enum Expr<'a, 'tcx: 'a> {
 }
 
 pub trait BackwardsAnalysis {
-    type Fact: PartialEq + Eq + Hash + Clone + Debug + PartialOrd + Ord;
+    type Facts: PartialEq + Eq + Hash + Debug + PartialOrd + Ord + Default + Clone;
     // The facts which are made by evaluating this expression. Comes up during some terminators.
-    fn generate<'a, 'tcx, 'mir>(mir_id: NodeId, crate_info: &CrateInfo<'mir,'tcx>,
-                                expr: Expr<'a, 'tcx>) -> Vec<Self::Fact>;
+    fn generate<'a, 'b, 'tcx: 'a + 'b + 'mir, 'mir, 'gcx: 'tcx>
+        (mir_info: MIRInfo<'b, 'mir, 'gcx, 'tcx>, expr: Expr<'a, 'tcx>) -> Self::Facts;
 
     // Produces the set of facts before the execution of a statement.
-    fn transfer<'mir,'tcx>(mir_id: NodeId,
-                           crate_info: &CrateInfo<'mir,'tcx>,
-                           post_facts: &HashSet<Self::Fact>,
-                           lvalue: &Lvalue<'tcx>,
-                           rvalue: &Rvalue<'tcx>)
-                           -> HashSet<Self::Fact>;
+    fn transfer<'a,'mir,'tcx:'a,'gcx:'tcx>(mir_info: MIRInfo<'a,'mir,'gcx,'tcx>,
+                                           post_facts: &Self::Facts,
+                                           statement: &StatementKind<'tcx>)
+                                           -> Self::Facts;
 
-    // Produces the set of facts before the call of a function
-    fn fn_call_transfer<'mir,'tcx>(mir_id: NodeId,
-                                   crate_info: &CrateInfo<'mir,'tcx>,
-                                   context_and_fn_to_fact_map: &CrateFactsMap<Self::Fact>,
-                                   post_facts: &HashSet<Self::Fact>,
-                                   fn_op: &Operand<'tcx>,
-                                   arg_ops: &Vec<Operand<'tcx>>,
-                                   dest: &Lvalue<'tcx>)
-                                   -> (Option<FullCx<Self::Fact>>, HashSet<Self::Fact>);
     // Produces the set of facts before a forward split in the CFG.
-    fn join(many: Vec<&HashSet<Self::Fact>>) -> HashSet<Self::Fact>;
+    fn join(left: &Self::Facts, right: &Self::Facts) -> Self::Facts;
+
+    fn join_many(many: Vec<&Self::Facts>) -> Self::Facts {
+        many.into_iter().fold(Self::Facts::default(), |acc, item| Self::join(&acc, item))
+    }
 
     fn flow<'mir,'tcx>(mir_map: &'mir MirMap<'tcx>,
                        tcx: ty::TyCtxt<'mir,'tcx,'tcx>)
-                       -> AnalysisState<'mir,'tcx,Self::Fact> {
+                       -> AnalysisState<'mir,'tcx,Self::Facts> {
         let mut state = AnalysisState::new(mir_map, tcx);
         while let Some(work_item) = state.queue.get() {
             Self::flow_work_item(work_item, &mut state);
@@ -267,8 +313,8 @@ pub trait BackwardsAnalysis {
     /// Flows till convergence on a single (MIR,CX) - just looks up the results of other functions.
     /// Manipulates the state - changing (MIR,CX) dependencies and the queue.
     fn flow_work_item<'mir,'tcx>(
-        work_item: WorkItem<Self::Fact>,
-        state: &mut AnalysisState<Self::Fact>
+        work_item: WorkItem<Self::Facts>,
+        state: &mut AnalysisState<Self::Facts>
     ) {
 
         // If the terminator just evaluates an expression (no assignment), this produces that
@@ -334,11 +380,11 @@ pub trait BackwardsAnalysis {
                 // TODO handle non-static calls
                 Call { destination: Some((ref lval, next_bb)), ref func, ref args, .. } => {
                     let post_idx = StatementIdx(next_bb, 0);
-                    let empty_set: HashSet<Self::Fact> = HashSet::new();
+                    let empty = Self::Facts::default();
                     let (maybe_dependency, new_pre_facts) =
                         Self::fn_call_transfer(mir_id, &state.info,
                                                &state.context_and_fn_to_fact_map,
-                                               mir_facts.get(&post_idx).unwrap_or(&empty_set),
+                                               mir_facts.get(&post_idx).unwrap_or(&empty),
                                                func, args, lval);
                     if let Some(dep) = maybe_dependency {
                         println!("    Dependency on {:?}, from {:?}", dep, bb_idx);
@@ -355,7 +401,7 @@ pub trait BackwardsAnalysis {
                     mir_facts.insert(pre_idx, new_pre_facts);
                 },
                 Return => {
-                    let new_pre_facts = context.iter().cloned().collect();
+                    let new_pre_facts = context.clone();
                     let change = mir_facts.remove(&pre_idx).map(|pre_facts|
                         pre_facts != new_pre_facts
                     ).unwrap_or(true);
@@ -368,18 +414,19 @@ pub trait BackwardsAnalysis {
                         for succ_bb_idx in other.successors().iter() {
                             let post_idx = StatementIdx(*succ_bb_idx, 0);
                             if !mir_facts.contains_key(&post_idx) {
-                                mir_facts.insert(post_idx, HashSet::new());
+                                mir_facts.insert(post_idx, Self::Facts::default());
                             }
                         }
                         for succ_bb_idx in other.successors().iter() {
                             let post_idx = StatementIdx(*succ_bb_idx, 0);
                             post_facts.push(mir_facts.get(&post_idx).unwrap());
                         }
-                        Self::join(post_facts)
+                        Self::join_many(post_facts)
                     };
-                    evaluated_expression(other).map(|expr|
-                        new_pre_facts.extend(Self::generate(mir_id, &state.info, expr))
-                    );
+                    let mir_info = state.info.get_mir_info(&mir_id);
+                    evaluated_expression(other).map(|expr| {
+                        new_pre_facts = Self::join(&new_pre_facts, &Self::generate(mir_info, expr))
+                    });
                     let change = mir_facts.remove(&pre_idx).map(|pre_facts|
                         pre_facts != new_pre_facts
                     ).unwrap_or(true);
@@ -416,21 +463,30 @@ pub trait BackwardsAnalysis {
         state.context_and_fn_to_fact_map.insert(full_cx, mir_facts);
     }
 
+    fn fn_call_transfer<'mir,'tcx>(mir_id: NodeId,
+                                   crate_info: &CrateInfo<'mir,'tcx>,
+                                   context_and_fn_to_fact_map: &CrateFactsMap<Self::Facts>,
+                                   post_facts: &Self::Facts,
+                                   fn_op: &Operand<'tcx>,
+                                   arg_ops: &Vec<Operand<'tcx>>,
+                                   dest: &Lvalue<'tcx>)
+                                   -> (Option<AnalysisUnit<Self::Facts>>, Self::Facts);
+
 
     /// Apply the transfer function across this statment, which must lie between the two indices.
     /// Returns whether or not the facts for `pre_idx` actually changed because of the transfer
     /// function, so that the caller can detect when the flow stabilizes.
     fn apply_transfer<'mir,'gcx,'tcx>(mir_id: NodeId,
                                       crate_info: &CrateInfo<'mir,'tcx>,
-                                      mir_facts: &mut MIRFactsMap<Self::Fact>,
+                                      mir_facts: &mut MIRFactsMap<Self::Facts>,
                                       pre_idx: StatementIdx,
                                       post_idx: StatementIdx,
                                       statement: &StatementKind<'tcx>)
                                       -> bool {
         let new_pre_facts = {
-            let post_facts = mir_facts.entry(post_idx).or_insert(HashSet::new());
-            let &StatementKind::Assign(ref lval, ref rval) = statement;
-            Self::transfer(mir_id, crate_info, post_facts, lval, rval)
+            let post_facts = mir_facts.entry(post_idx).or_insert_with(Self::Facts::default);
+            let mir_info = crate_info.get_mir_info(&mir_id);
+            Self::transfer(mir_info, post_facts, statement)
         };
         let old_facts = mir_facts.remove(&pre_idx);
         let change = old_facts.as_ref().map_or(true, |facts| *facts != new_pre_facts);

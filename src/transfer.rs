@@ -1,5 +1,8 @@
 use path::{Path,PathRef,Projection,TmpPath,TmpProjection,Projectable};
 use base_var::BaseVar;
+use backflow::{CrateInfo,MIRInfo};
+
+use std::iter::{FromIterator,IntoIterator};
 
 use rustc::mir::repr::{
     CastKind,
@@ -11,16 +14,96 @@ use rustc::mir::repr::{
     Statement,
     StatementKind,
     Rvalue,
+    Var,
 };
 
 use rustc::ty::{TypeVariants,TyCtxt};
 use rustc_data_structures::indexed_vec::Idx;
 
 use std::mem;
-use std::collections::{BTreeSet,BTreeMap};
+use std::collections::{BTreeSet,BTreeMap,btree_map};
+
+const MAX_PATH_LEN: usize = 10;
 
 /// A critical path, including the path and why it's critical
-pub type Facts = BTreeMap<Path, CriticalUse>;
+#[derive(PartialEq,Eq,PartialOrd,Ord,Hash,Debug,Clone,Default)]
+pub struct Facts {
+    map: BTreeMap<Path, CriticalUse>,
+}
+
+impl Facts {
+    pub fn empty() -> Self {
+        Facts { map: BTreeMap::new() }
+    }
+
+    /// Insert this (path, use) into the set of facts.
+    /// This handles a number of subtleties:
+    ///    1. If the path is too long it will be truncated to a shorter `Value` path
+    ///    2. If the path is implied by an existing `Value` path it will not be inserted.
+    ///    3. If the path is a `Value` path and implies existing paths, they will be removed.
+    pub fn insert(&mut self, mut path: Path, mut u: CriticalUse) {
+        if path.truncate(MAX_PATH_LEN) {
+            u = CriticalUse::Value;
+        }
+        let implied_by_existing = self.map.iter().any(|(p2, u2)| {
+            (u2 == &CriticalUse::Value) && path.contains(p2)
+        });
+        if !implied_by_existing {
+            if u == CriticalUse::Value {
+                let tmp_map = mem::replace(&mut self.map, BTreeMap::new());
+                for (p2, u2) in tmp_map.into_iter().filter(|&(ref p2, _)| !p2.contains(&path)) {
+                    self.map.insert(p2, u2);
+                }
+            }
+            self.map.insert(path, u);
+        }
+    }
+    pub fn get(&self, p: &Path) -> Option<&CriticalUse> {
+        self.map.get(p)
+    }
+    pub fn keys<'a>(&'a self) -> btree_map::Keys<'a,Path,CriticalUse> {
+        self.map.keys()
+    }
+    pub fn remove(&mut self, path: &Path, u: &CriticalUse) {
+        if self.map.get(path) == Some(u) {
+            self.map.remove(path);
+        }
+    }
+    pub fn iter(&self) -> btree_map::Iter<Path,CriticalUse> {
+        self.map.iter()
+    }
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
+impl IntoIterator for Facts {
+    type Item = (Path, CriticalUse);
+    type IntoIter = btree_map::IntoIter<Path, CriticalUse>;
+    fn into_iter(self) -> btree_map::IntoIter<Path, CriticalUse> {
+        self.map.into_iter()
+    }
+}
+
+impl FromIterator<(Path, CriticalUse)> for Facts
+    where Path: Ord {
+    fn from_iter<T>(iter: T) -> Facts
+        where T: IntoIterator<Item=(Path, CriticalUse)> {
+        let mut paths = Facts::empty();
+        paths.extend(iter.into_iter());
+        paths
+    }
+}
+
+impl Extend<(Path, CriticalUse)> for Facts {
+    fn extend<T>(&mut self, iter: T)
+        where T: IntoIterator<Item=(Path, CriticalUse)> {
+        for (path, u) in iter {
+            self.insert(path, u);
+        }
+    }
+}
+
 pub type Fact = (Path, CriticalUse);
 
 #[derive(Debug,Hash,PartialEq,Eq,PartialOrd,Ord,Clone)]
@@ -31,30 +114,6 @@ pub enum CriticalUse {
     /// This value is somehow important.
     /// This is a very general statement, so it's hard to 'sink' this critical use.
     Value,
-}
-
-#[derive(Clone, Copy)]
-pub struct MIRInfo<'a, 'mir: 'a, 'gcx: 'tcx +'mir + 'a, 'tcx: 'mir + 'a>{
-    mir: &'a Mir<'tcx>,
-    tcx: TyCtxt<'mir, 'gcx, 'tcx>
-}
-
-impl<'a, 'mir: 'a, 'gcx: 'tcx +'mir + 'a, 'tcx: 'mir + 'a> MIRInfo<'a, 'mir, 'gcx, 'tcx> {
-    pub fn lvalue_ty(&self, lvalue: &Lvalue<'tcx>) -> &TypeVariants<'tcx> {
-        &self.mir.lvalue_ty(self.tcx, lvalue).to_ty(self.tcx).sty
-    }
-
-    pub fn is_raw_ptr(&self, lvalue: &Lvalue<'tcx>) -> bool {
-        if let &TypeVariants::TyRawPtr(_) = self.lvalue_ty(lvalue) {
-            true
-        } else { false }
-    }
-
-    pub fn is_ref(&self, lvalue: &Lvalue<'tcx>) -> bool {
-        if let &TypeVariants::TyRef(_,_) = self.lvalue_ty(lvalue) {
-            true
-        } else { false }
-    }
 }
 
 /// The path an Lvalue refers to
@@ -116,11 +175,11 @@ pub fn rvalue_path(rvalue: &Rvalue) -> Option<Path> {
 }
 
 pub fn join_many<'a, I: Iterator<Item=&'a Facts>>(iter: I) -> Facts {
-    iter.fold(BTreeMap::new(), |acc, item| join(&acc, item))
+    iter.fold(Facts::empty(), |acc, item| join(&acc, item))
 }
 
 pub fn join(left: &Facts, right: &Facts) -> Facts {
-    let mut new_facts = BTreeMap::new();
+    let mut new_facts = Facts::empty();
     for path in left.keys().chain(right.keys()) {
         let u = match (left.get(path), right.get(path)) {
             (Some(&CriticalUse::Value), _) => CriticalUse::Value,
@@ -129,15 +188,9 @@ pub fn join(left: &Facts, right: &Facts) -> Facts {
             (_, Some(&CriticalUse::Deref)) => CriticalUse::Deref,
             _ => unreachable!(),
         };
-        if u == CriticalUse::Value {
-            //TODO If an existng path a is superpath of path, remove it.
-            if !new_facts.iter().filter(|&(_, u)| u == &CriticalUse::Value)
-                .any(|(p, _)| path.contains(p)) {
-                new_facts.insert(path.clone(), u);
-            }
-        } else {
-            new_facts.insert(path.clone(), u);
-        }
+        // Insert is smart enough to remove duplicates & implications. Even the above isn't needed,
+        // although it probably boosts performance.
+        new_facts.insert(path.clone(), u);
     }
     new_facts
 }
@@ -146,15 +199,16 @@ pub fn join(left: &Facts, right: &Facts) -> Facts {
 pub fn difference(left: &Facts, right: &BTreeSet<Path>) -> Facts {
     let mut diff = left.clone();
     for path in right {
-        diff.remove(&path);
+        diff.remove(&path, &CriticalUse::Value);
+        diff.remove(&path, &CriticalUse::Deref);
     }
     diff
 }
 
 pub fn gen_by_statement<'a, 'mir, 'gcx, 'tcx>(info: MIRInfo<'a, 'mir, 'gcx, 'tcx>,
-                                              statement: &Statement<'tcx>)
+                                              statement: &StatementKind<'tcx>)
                                               -> Facts {
-    let StatementKind::Assign(ref lvalue, ref rvalue) = statement.kind;
+    let StatementKind::Assign(ref lvalue, ref rvalue) = *statement;
     join(&gen_by_lvalue(info, lvalue),& gen_by_rvalue(info, rvalue))
 }
 pub fn gen_by_operand<'a, 'mir, 'gcx, 'tcx>(info: MIRInfo<'a, 'mir, 'gcx, 'tcx>,
@@ -164,7 +218,7 @@ pub fn gen_by_operand<'a, 'mir, 'gcx, 'tcx>(info: MIRInfo<'a, 'mir, 'gcx, 'tcx>,
     match operand {
         &Consume(ref lvalue) => gen_by_lvalue(info, lvalue),
         //Constants contain no projections - definitely safe.
-        &Constant(_) => BTreeMap::new(),
+        &Constant(_) => Facts::empty(),
     }
 }
 
@@ -191,7 +245,7 @@ pub fn gen_by_lvalue<'a, 'mir, 'gcx, 'tcx>(info: MIRInfo<'a, 'mir, 'gcx, 'tcx>,
             facts
         },
         // Its just a basic variable.
-        _ => BTreeMap::new(),
+        _ => Facts::empty(),
     }
 }
 
@@ -218,29 +272,17 @@ pub fn gen_by_rvalue<'a, 'mir, 'gcx, 'tcx>(info: MIRInfo<'a, 'mir, 'gcx, 'tcx>,
         }
 
         InlineAsm { .. } => unimplemented!(),
-        Box(_) => BTreeMap::new(),
+        Box(_) => Facts::empty(),
     }
 }
 
 #[allow(unused_variables)]
 pub fn kill<'a, 'mir, 'gcx, 'tcx>(info: MIRInfo<'a, 'mir, 'gcx, 'tcx>,
-                                  statement: &Statement<'tcx>)
+                                  statement: &StatementKind<'tcx>)
                                   -> BTreeSet<Path> {
-    let StatementKind::Assign(ref lvalue, ref rvalue) = statement.kind;
+    let StatementKind::Assign(ref lvalue, ref rvalue) = *statement;
     BTreeSet::new()
 }
-
-#[allow(unused_variables)]
-pub fn singular<'a, 'mir, 'gcx, 'tcx>(info: MIRInfo<'a, 'mir, 'gcx, 'tcx>, p1: PathRef) -> bool { true }
-
-#[allow(unused_variables)]
-pub fn must_alias<'a, 'mir, 'gcx, 'tcx>(info: MIRInfo<'a, 'mir, 'gcx, 'tcx>, p1: PathRef, p2: PathRef) -> bool { false }
-
-#[allow(unused_variables)]
-pub fn may_alias<'a, 'mir, 'gcx, 'tcx>(info: MIRInfo<'a, 'mir, 'gcx, 'tcx>, p1: PathRef, p2: PathRef) -> bool { false }
-
-#[allow(unused_variables)]
-pub fn may_reach<'a, 'mir, 'gcx, 'tcx>(info: MIRInfo<'a, 'mir, 'gcx, 'tcx>, p1: PathRef, p2: PathRef) -> bool { false }
 
 /// Does a substitution from p1 to p2 in path. Returns a set of possible results from the
 /// substitution. This is generic over the type of path, so it works for both TmpPath and Path
@@ -257,7 +299,7 @@ fn sub<'a, 'mir, 'gcx, 'tcx, T: Projectable>(info: MIRInfo<'a, 'mir, 'gcx, 'tcx>
 //            None
 //        }
 //    }).collect()
-    let may_alias = may_alias(info, path.as_ref(), p1.as_ref());
+    let may_alias = info.may_alias(path.as_ref(), p1.as_ref());
     let mut inner_subs = match path.split() {
         (_, None) => vec![],
         (inner_path, Some(proj)) => {
@@ -288,7 +330,7 @@ fn val_sub<'a, 'mir, 'gcx, 'tcx>(info: MIRInfo<'a, 'mir, 'gcx, 'tcx>,
                                      critical_path: Path,
                                      p1: &Path,
                                      p2: &Path) -> Vec<Path> {
-    if may_reach(info, critical_path.as_ref(), p1.as_ref()) || sub(info, critical_path, p1, p2).len() > 0 {
+    if info.may_reach(critical_path.as_ref(), p1.as_ref()) || sub(info, critical_path, p1, p2).len() > 0 {
         vec![p2.clone()]
     } else { vec![] }
 }
@@ -356,10 +398,10 @@ pub fn flow_assign_lval_op_lval<'a, 'mir, 'gcx, 'tcx>(info: MIRInfo<'a, 'mir, 'g
     });
 
     let l2_is_crit = deref_post_facts.iter().any(|&(p,_)| {
-        p.sub_paths().into_iter().any(|(sub_p,_)| may_alias(info, sub_p, p1.as_ref()))
+        p.sub_paths().into_iter().any(|(sub_p,_)| info.may_alias(sub_p, p1.as_ref()))
     }) || value_post_facts.iter().any(|&(p,_)| val_sub(info, p.clone(), p1, &p2).len() > 0);
 
-    let mut pre_facts = BTreeMap::new();
+    let mut pre_facts = Facts::empty();
     if l2_is_crit { pre_facts.insert(p2, Value); }
     pre_facts
 }
@@ -372,7 +414,7 @@ pub fn flow_assign_lval_operand<'a, 'mir, 'gcx, 'tcx>(info: MIRInfo<'a, 'mir, 'g
     use rustc::mir::repr::Operand::*;
     match op {
         &Consume(ref r_lval) => flow_assign_lval_lval(info, l_path, r_lval, post_facts),
-        &Constant(_)         => BTreeMap::new(),
+        &Constant(_)         => Facts::empty(),
     }
 }
 
@@ -384,7 +426,7 @@ pub fn flow_assign_lval_op_operand<'a, 'mir, 'gcx, 'tcx>(info: MIRInfo<'a, 'mir,
     use rustc::mir::repr::Operand::*;
     match op {
         &Consume(ref r_lval) => flow_assign_lval_op_lval(info, l_path, r_lval, post_facts),
-        &Constant(_)         => BTreeMap::new(),
+        &Constant(_)         => Facts::empty(),
     }
 }
 
@@ -401,13 +443,13 @@ fn reduce_and_secure(p: TmpPath, u: CriticalUse) -> Option<(Path, CriticalUse)> 
 }
 
 pub fn flow<'a, 'mir, 'gcx, 'tcx>(info: MIRInfo<'a, 'mir, 'gcx, 'tcx>,
-                                  statement: &Statement<'tcx>,
+                                  statement: &StatementKind<'tcx>,
                                   post_facts: &Facts)
                                   -> Facts {
     use rustc::mir::repr::Rvalue::*;
     use rustc::mir::repr::Operand::*;
     use rustc::mir::repr::AggregateKind::{Tuple, Adt, Closure, Vec as VecAgg};
-    let StatementKind::Assign(ref l1, ref rvalue) = statement.kind;
+    let StatementKind::Assign(ref l1, ref rvalue) = *statement;
     let p1 = &lvalue_path(l1);
     match rvalue {
         &Use(ref op) => flow_assign_lval_operand(info, p1, op, post_facts),
@@ -417,17 +459,17 @@ pub fn flow<'a, 'mir, 'gcx, 'tcx>(info: MIRInfo<'a, 'mir, 'gcx, 'tcx>,
         &Cast(_, Consume(ref l2), _) => {
             let mut pre_facts = flow_assign_lval_lval(info, p1, l2, post_facts);
             if info.is_ref(&l2) {
-                pre_facts.remove(&lvalue_path(&l2));
+                pre_facts.remove(&lvalue_path(&l2),&CriticalUse::Deref);
             }
             pre_facts
         }
-        &Cast(_, Constant(_), _) => BTreeMap::new(),
+        &Cast(_, Constant(_), _) => Facts::empty(),
         &BinaryOp(_, ref op1, ref op2) |
         &CheckedBinaryOp(_, ref op1, ref op2) =>
             join(&flow_assign_lval_op_operand(info, p1, op1, post_facts),
                  &flow_assign_lval_op_operand(info, p1, op2, post_facts)),
         &UnaryOp(_, ref op) => flow_assign_lval_operand(info, p1, op, post_facts),
-        &Box(_) => BTreeMap::new(),
+        &Box(_) => Facts::empty(),
         &Aggregate(VecAgg, ref operands) =>
             join_many(
                 operands.iter()
@@ -461,7 +503,7 @@ pub fn flow<'a, 'mir, 'gcx, 'tcx>(info: MIRInfo<'a, 'mir, 'gcx, 'tcx>,
 }
 
 pub fn transfer<'a, 'mir, 'gcx, 'tcx>(info: MIRInfo<'a, 'mir, 'gcx, 'tcx>,
-                                      statement: &Statement<'tcx>,
+                                      statement: &StatementKind<'tcx>,
                                       post_facts: &Facts)
                                       -> Facts {
     let gen = &gen_by_statement(info, statement);

@@ -167,6 +167,18 @@ impl Path {
         Path {projections: projs, base: base}
     }
 
+    /// Cut the path down to at most `len` projections. Reports `true` if projections were actually
+    /// cut off.
+    pub fn truncate(&mut self, len: usize) -> bool {
+        let needs_truncation = self.projections.len() > len;
+        self.projections.truncate(len);
+        needs_truncation
+    }
+
+    pub fn change_base_var(&mut self, base: BaseVar) {
+        self.base = base;
+    }
+
     pub fn from_base_var(base: BaseVar) -> Path {
         Path { projections: vec![], base: base }
     }
@@ -233,6 +245,17 @@ impl Path {
     pub fn split(mut self) -> (Self, Option<Projection>) {
         let proj = self.projections.pop();
         (self, proj)
+    }
+
+    pub fn has_base_var(&self, base: &BaseVar) -> bool {
+        self.base == *base
+    }
+
+    pub fn of_argument(&self) -> bool {
+        match self.base {
+            BaseVar::Arg(_) => true,
+            _ => false,
+        }
     }
 }
 
