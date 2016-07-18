@@ -20,25 +20,36 @@ use rustc::mir::repr::{BasicBlock,
                        Var,
 };
 
+use base_var::BaseVar;
+
 use rustc_data_structures::indexed_vec::Idx;
 
 use rustc::mir::traversal;
 use rustc::mir::mir_map::MirMap;
-use rustc::ty::{self,TyCtxt,TypeVariants};
+use rustc::middle::privacy::AccessLevels;
+use rustc::ty::{self,TyCtxt,TypeVariants,Ty,TypeAndMut};
 
 use dep_graph::KeyedDepGraph;
 
 use syntax::ast::NodeId;
 use syntax::codemap::Span;
 
-use std::collections::{BTreeSet,HashSet,HashMap,VecDeque};
+use std::collections::{BTreeSet,BTreeMap,HashSet,HashMap,VecDeque};
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::iter::{self,IntoIterator};
 
 use path::PathRef;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+use std::io::Write;
+macro_rules! errln(
+    ($($arg:tt)*) => { {
+        let r = writeln!(&mut ::std::io::stderr(), $($arg)*);
+        r.expect("failed printing to stderr");
+    } }
+);
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 // A unique index for each statement in a MIR. First, the basic block, then the position of the
 // statment in the basic block. Often this is used to refer to positions between statements, in
 // which case (_,0) is before the first statement in the BB, and (_,bb.len()) is after the last.
@@ -47,8 +58,8 @@ pub struct StatementIdx(BasicBlock,usize);
 pub const START_STMT: StatementIdx = StatementIdx(START_BLOCK, 0);
 
 pub type Context<Facts> = Facts;
-pub type MIRFactsMap<Facts> = HashMap<StatementIdx,Facts>;
-pub type CrateFactsMap<Facts> = HashMap<AnalysisUnit<Facts>,MIRFactsMap<Facts>>;
+pub type MIRFactsMap<Facts> = BTreeMap<StatementIdx,Facts>;
+pub type CrateFactsMap<Facts> = BTreeMap<AnalysisUnit<Facts>,MIRFactsMap<Facts>>;
 
 #[derive(Clone, Copy)]
 pub struct MIRInfo<'a, 'mir, 'gcx: 'tcx, 'tcx: 'mir + 'a>{
@@ -74,16 +85,134 @@ impl<'a, 'mir, 'gcx, 'tcx> MIRInfo<'a, 'mir, 'gcx, 'tcx> {
     }
 
     #[allow(unused_variables)]
-    pub fn singular(&self, p1: PathRef) -> bool { true }
+    pub fn singular(&self, p1: PathRef) -> bool { false }
 
-    #[allow(unused_variables)]
-    pub fn must_alias(&self, p1: PathRef, p2: PathRef) -> bool { false }
+    pub fn must_alias<'b>(&self, p1: PathRef<'b>, p2: PathRef<'b>) -> bool { p1 == p2 }
 
-    #[allow(unused_variables)]
-    pub fn may_alias(&self, p1: PathRef, p2: PathRef) -> bool { false }
+    pub fn may_alias<'b>(&self, p1: PathRef<'b>, p2: PathRef<'b>) -> bool {
+        p1 == p2 ||
+        ((p1.has_indirection() || p2.has_indirection()) && self.path_ty(p1) == self.path_ty(p2))
+    }
 
-    #[allow(unused_variables)]
-    pub fn may_reach(&self, p1: PathRef, p2: PathRef) -> bool { false }
+    pub fn may_reach<'b>(&self, p1: PathRef<'b>, p2: PathRef<'b>) -> bool { p1 == p2 }
+
+    pub fn path_ty(&self, p1: PathRef) -> Ty<'tcx> {
+        use path::Projection::*;
+        use rustc::ty::TypeVariants::*;
+        let mut ty = Self::narrow_to_single_ty(self.base_var_ty(p1.base));
+        for projection in p1.projections {
+            match projection {
+                &Deref => {
+                    ty = ty.builtin_deref(true, ty::LvaluePreference::NoPreference)
+                           .unwrap_or_else(|| {
+                                bug!("Path {:?} deref'd the type {:?}", p1, ty)
+                            }).ty
+                }
+                &Field(ref variant_idx, None) => {
+                    match ty.sty {
+                        TyEnum(_, _) => (),
+                        _ => { bug!("Path {:?} _just_ downcasts the type {:?}, with variant {}",
+                                    p1,
+                                    ty,
+                                    variant_idx); },
+                    }
+                }
+                &Field(variant_idx, Some(field_idx)) => {
+                    ty = match ty.sty {
+                        TyTuple(ref inner_tys) if variant_idx == 0 => inner_tys[field_idx],
+                        TyStruct(ref adt_def, ref substs) |
+                        TyEnum(ref adt_def, ref substs) =>
+                            adt_def.variants[variant_idx].fields[field_idx].ty(self.tcx, substs),
+                        _ => bug!("Path {:?} specifies field ({},{}) of type {:?}",
+                                  p1,
+                                  variant_idx,
+                                  field_idx,
+                                  ty),
+                    }
+                }
+            }
+        }
+        errln!("      Path {:?} has type {:?}", p1, ty);
+        ty
+    }
+
+    /// Returns true if the indicated PathRef corresponds to a publically visible location.
+    /// Public fields of exported structures count, as do primitive types, but nothing else does.
+    pub fn is_path_exported(&self, access_levels: &AccessLevels, p1: PathRef) -> bool {
+        use path::Projection::*;
+        use rustc::ty::TypeVariants::*;
+        let mut ty = Self::narrow_to_single_ty(self.base_var_ty(p1.base));
+        for projection in p1.projections {
+            match projection {
+                &Deref => {
+                    ty = ty.builtin_deref(true, ty::LvaluePreference::NoPreference)
+                           .unwrap_or_else(|| {
+                                bug!("Path {:?} deref'd the type {:?}", p1, ty)
+                            }).ty
+                }
+                &Field(ref variant_idx, None) => {
+                    let not_exported = match ty.sty {
+                        TyEnum(ref adt_def, _) => self.tcx.map.as_local_node_id(adt_def.did)
+                            .map(|node_id| access_levels.is_reachable(node_id))
+                            .unwrap_or(false),
+                        _ => { bug!("Path {:?} _just_ downcasts the type {:?}, with variant {}",
+                                    p1,
+                                    ty,
+                                    variant_idx); },
+                    };
+                    if not_exported { return false; }
+                },
+                &Field(variant_idx, Some(field_idx)) => {
+                    ty = match ty.sty {
+                        TyTuple(ref inner_tys) if variant_idx == 0 => inner_tys[field_idx],
+                        TyStruct(ref adt_def, ref substs) |
+                        TyEnum(ref adt_def, ref substs) => {
+                            let not_exported = self.tcx.map.as_local_node_id(adt_def.did)
+                                .map(|node_id| access_levels.is_reachable(node_id))
+                                .unwrap_or(false);
+                            if not_exported {
+                                return false;
+                            }
+                            let ref field = adt_def.variants[variant_idx].fields[field_idx];
+                            if field.vis != ty::Visibility::Public {
+                                return false;
+                            }
+                            field.ty(self.tcx, substs)
+                        },
+                        _ => bug!("Path {:?} specifies field ({},{}) of type {:?}",
+                                  p1,
+                                  variant_idx,
+                                  field_idx,
+                                  ty),
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    /// This function reduces array and slice types (collection types) to their component type. The
+    /// reason we do this is the analysis does not record slice / index projections in the paths.
+    /// Thus, when considering a path `*p` on a `p` with type [*const T], we need to skip over the
+    /// [] and deref the *const T to get T.
+    fn narrow_to_single_ty(mut ty: Ty<'tcx>) -> Ty<'tcx> {
+        use rustc::ty::TypeVariants::*;
+        while let Some(inner_ty) = ty.builtin_index() {
+            ty = inner_ty;
+        }
+        ty
+    }
+
+    fn base_var_ty(&self, base: &BaseVar) -> Ty<'tcx> {
+        use base_var::BaseVar::*;
+        match base {
+            &Var(var) => self.mir.lvalue_ty(self.tcx, &Lvalue::Var(var)).to_ty(self.tcx),
+            &Temp(temp) => self.mir.lvalue_ty(self.tcx, &Lvalue::Temp(temp)).to_ty(self.tcx),
+            &Arg(arg) => self.mir.lvalue_ty(self.tcx, &Lvalue::Arg(arg)).to_ty(self.tcx),
+            &Static(def_id) => self.mir.lvalue_ty(self.tcx, &Lvalue::Static(def_id)).to_ty(self.tcx),
+            &ReturnPointer => self.mir.lvalue_ty(self.tcx, &Lvalue::ReturnPointer).to_ty(self.tcx),
+        }
+    }
 
     pub fn fresh_var(&self) -> Var {
         Var::new(self.mir.var_decls.len())
@@ -234,7 +363,7 @@ impl<'mir,'tcx, Facts: Eq + Hash + Ord + Default + Clone> AnalysisState<'mir,'tc
     fn new(mir_map: &'mir MirMap<'tcx>, tcx: ty::TyCtxt<'mir,'tcx,'tcx>)
            -> AnalysisState<'mir,'tcx,Facts> {
         AnalysisState {
-            context_and_fn_to_fact_map: HashMap::new(),
+            context_and_fn_to_fact_map: BTreeMap::new(),
             info: CrateInfo::new(mir_map, tcx),
             queue: WorkQueue::new(mir_map.map.keys().map(|id| (*id, Facts::default()))),
         }
@@ -337,7 +466,7 @@ pub trait BackwardsAnalysis {
         let mir = state.info.mir_map.map.get(&mir_id).unwrap();
         println!("Pulling full ctx {:?}", full_cx);
         let mut mir_facts = state.context_and_fn_to_fact_map.remove(&full_cx)
-            .unwrap_or(HashMap::new());
+            .unwrap_or(BTreeMap::new());
 
         // Initialize work queue with Basic Blocks from the flow source
         let mut bb_queue: VecDeque<BasicBlock> = VecDeque::new();

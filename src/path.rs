@@ -71,9 +71,10 @@ pub struct Path {
     base: BaseVar,
 }
 
+#[derive(Hash,PartialEq,Eq,PartialOrd,Ord,Clone)]
 pub struct PathRef<'a> {
-    projections: &'a [Projection],
-    base: &'a BaseVar
+    pub projections: &'a [Projection],
+    pub base: &'a BaseVar
 }
 
 //TODO: Rewrite with slice pattterns <3
@@ -158,6 +159,12 @@ impl Projectable for Path {
 
     fn last_projection_mut(&mut self) -> Option<&mut Projection> {
         self.projections.last_mut()
+    }
+}
+
+impl<'a> PathRef<'a> {
+    pub fn has_indirection(&self) -> bool {
+        self.projections.iter().any(|p| p == &Projection::Deref)
     }
 }
 
@@ -259,7 +266,7 @@ impl Path {
     }
 }
 
-impl fmt::Debug for Path {
+impl<'a> fmt::Debug for PathRef<'a> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         for projection in self.projections.iter() {
             match *projection {
@@ -278,9 +285,9 @@ impl fmt::Debug for Path {
     }
 }
 
-impl fmt::Display for Path {
+impl fmt::Debug for Path {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{:?}", self.as_ref())
     }
 }
 

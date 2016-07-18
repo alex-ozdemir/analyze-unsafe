@@ -41,13 +41,13 @@ use rustc_driver::driver::CompileState;
 
 use syntax::diagnostics;
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::hash::Hash;
-use std::io::Write;
 use std::mem;
 use std::path::PathBuf;
 
+use std::io::Write;
 macro_rules! errln(
     ($($arg:tt)*) => { {
         let r = writeln!(&mut ::std::io::stderr(), $($arg)*);
@@ -184,7 +184,7 @@ impl<'a,'callback: 'a> CompilerCalls<'a> for AnalyzeUnsafe<'callback> {
 
 
 #[allow(dead_code)]
-fn print_map_lines<K: Debug + Eq + Hash, V: Debug>(map: &HashMap<K, V>) {
+fn print_map_lines<K: Debug + Eq + Ord, V: Debug>(map: &BTreeMap<K, V>) {
     println!("Map:");
     for (key, val) in map.iter() {
         println!("  {:?} : {:?}", key, val);

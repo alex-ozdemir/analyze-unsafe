@@ -204,19 +204,16 @@ impl<'mir,'tcx> AnalysisState<'mir,'tcx,Facts> {
                      analysis: &ty::CrateAnalysis,
                      hir: &hir::Crate)
                      -> Vec<(Span,String)> {
-        errln!("Hi from linter!");
         // Get a list of ids for the unsafe functions (TODO there's got to be a better way)
         let unsafe_fn_ids = get_unsafe_fn_ids(hir);
         // Look through all safe exports
         analysis.access_levels.map.iter().filter(|&(id, _)|
             !unsafe_fn_ids.contains(id)
         ).filter_map(|(id, _)| {
-            errln!("Fn: {}", id);
             self.info.node_id_to_mir(id).and_then(|mir| {
                 let start_facts: &Facts = self.context_and_fn_to_fact_map
                     .get(&(*id, Facts::empty())).unwrap().get(&START_STMT).unwrap();
                 let concerning_paths: Vec<_> = start_facts.iter().filter_map(|(path, u)| {
-                    errln!("  - {}", path);
                     if path.of_argument() {
                         Some(format!("{:?}", path))
                     } else { None }
