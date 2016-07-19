@@ -57,14 +57,31 @@ pub struct StatementIdx(BasicBlock,usize);
 
 pub const START_STMT: StatementIdx = StatementIdx(START_BLOCK, 0);
 
-pub type Context<Facts> = Facts;
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+pub enum Context<Facts> {
+    /// This indicates the context which could exist when the function is called by the user. It is
+    /// influence by the private fields which have been made critical.
+    UserCx,
+    InternalCx(Facts),
+}
 pub type MIRFactsMap<Facts> = BTreeMap<StatementIdx,Facts>;
 pub type CrateFactsMap<Facts> = BTreeMap<AnalysisUnit<Facts>,MIRFactsMap<Facts>>;
 
 #[derive(Clone, Copy)]
 pub struct MIRInfo<'a, 'mir, 'gcx: 'tcx, 'tcx: 'mir + 'a>{
     mir: &'a Mir<'tcx>,
-    tcx: TyCtxt<'mir, 'gcx, 'tcx>
+    tcx: TyCtxt<'mir, 'gcx, 'tcx>,
+    /// This flag indicates whether MIRInfo should skip the sound alias analysis in favor of an
+    /// optimistic one (all distinct paths not may alias).
+    ///
+    /// This is used when assigning actual parameters to formal ones, and is a pretty dirty Hack.
+    /// The right way to do it is to abstract out the functionality of MIRInfo as traits such as
+    /// 'AliasKnoweldge' and 'TypeKnowledge', and then program generically.
+    ///
+    /// This would allow us to swap in a new alias logic as needed.
+    ///
+    /// But for now ...
+    optimistic_alias: bool,
 }
 
 impl<'a, 'mir, 'gcx, 'tcx> MIRInfo<'a, 'mir, 'gcx, 'tcx> {
@@ -84,16 +101,28 @@ impl<'a, 'mir, 'gcx, 'tcx> MIRInfo<'a, 'mir, 'gcx, 'tcx> {
         } else { false }
     }
 
+    pub fn set_optimistic_alias(&mut self, optimistic: bool) {
+        self.optimistic_alias = optimistic;
+    }
+
     #[allow(unused_variables)]
     pub fn singular(&self, p1: PathRef) -> bool { false }
 
     pub fn must_alias<'b>(&self, p1: PathRef<'b>, p2: PathRef<'b>) -> bool { p1 == p2 }
 
     pub fn may_alias<'b>(&self, p1: PathRef<'b>, p2: PathRef<'b>) -> bool {
-        p1 == p2 ||
-        ((p1.has_indirection() || p2.has_indirection()) && self.path_ty(p1) == self.path_ty(p2))
+        if !self.optimistic_alias {
+            p1 == p2
+            || (
+                (p1.has_indirection() || p2.has_indirection())
+                && self.path_ty(p1) == self.path_ty(p2)
+            )
+        } else {
+            p1 == p2
+        }
     }
 
+    // TODO!
     pub fn may_reach<'b>(&self, p1: PathRef<'b>, p2: PathRef<'b>) -> bool { p1 == p2 }
 
     pub fn path_ty(&self, p1: PathRef) -> Ty<'tcx> {
@@ -231,7 +260,7 @@ pub struct CrateInfo<'mir,'tcx:'mir> {
 impl<'mir, 'tcx> CrateInfo<'mir, 'tcx> {
     pub fn get_mir_info(&self, mir_id: &NodeId) -> MIRInfo<'mir, 'mir, 'tcx, 'tcx> {
         let mir = self.mir_map.map.get(mir_id).expect("CrateInfo created for an invalid MIRID");
-        MIRInfo{ mir: mir, tcx: self.tcx.clone() }
+        MIRInfo{ mir: mir, tcx: self.tcx.clone(), optimistic_alias: false }
     }
 }
 
@@ -246,6 +275,9 @@ pub struct AnalysisState<'mir,'tcx:'mir,Facts> {
 
     // Info about the crate, independent of the analysis
     pub info: CrateInfo<'mir,'tcx>,
+
+    // Info about which private fields are currently critical
+    
 }
 
 /// The WorkQueue data structure not only provides a queue of analyses (MIR,CX) to run, it also
@@ -439,6 +471,11 @@ pub trait BackwardsAnalysis {
         state
     }
 
+    fn substatiate_au<'mir,'tcx>(
+        state: &mut AnalysisState<Self::Facts>,
+        au: AnalysisUnit<Self::Facts>
+    ) {
+
     /// Flows till convergence on a single (MIR,CX) - just looks up the results of other functions.
     /// Manipulates the state - changing (MIR,CX) dependencies and the queue.
     fn flow_work_item<'mir,'tcx>(
@@ -462,10 +499,10 @@ pub trait BackwardsAnalysis {
             }
         }
         let WorkItem(mir_id, context, flow_source) = work_item;
-        let full_cx = (mir_id, context.clone());
+        let au = (mir_id, context.clone());
         let mir = state.info.mir_map.map.get(&mir_id).unwrap();
-        println!("Pulling full ctx {:?}", full_cx);
-        let mut mir_facts = state.context_and_fn_to_fact_map.remove(&full_cx)
+        println!("Pulling full ctx {:?}", au);
+        let mut mir_facts = state.context_and_fn_to_fact_map.remove(&au)
             .unwrap_or(BTreeMap::new());
 
         // Initialize work queue with Basic Blocks from the flow source
@@ -518,8 +555,8 @@ pub trait BackwardsAnalysis {
                     if let Some(dep) = maybe_dependency {
                         println!("    Dependency on {:?}, from {:?}", dep, bb_idx);
                         // We don't want to register dependencies on ourselves.
-                        if dep != full_cx {
-                            state.queue.register_dependency(&full_cx, dep, bb_idx);
+                        if dep != au {
+                            state.queue.register_dependency(&au, dep, bb_idx);
                         }
                     }
 
@@ -585,11 +622,11 @@ pub trait BackwardsAnalysis {
 
         if mir_facts.get(&START_STMT) != start_facts.as_ref() {
             // If our start facts changed, we've got to work on the dependencies
-            state.queue.enqueue_dependents(&full_cx);
+            state.queue.enqueue_dependents(&au);
         }
-        println!("Putting back ctx {:?}", full_cx);
+        println!("Putting back ctx {:?}", au);
         //print_map_lines(&mir_facts);
-        state.context_and_fn_to_fact_map.insert(full_cx, mir_facts);
+        state.context_and_fn_to_fact_map.insert(au, mir_facts);
     }
 
     fn fn_call_transfer<'mir,'tcx>(mir_id: NodeId,
@@ -600,7 +637,6 @@ pub trait BackwardsAnalysis {
                                    arg_ops: &Vec<Operand<'tcx>>,
                                    dest: &Lvalue<'tcx>)
                                    -> (Option<AnalysisUnit<Self::Facts>>, Self::Facts);
-
 
     /// Apply the transfer function across this statment, which must lie between the two indices.
     /// Returns whether or not the facts for `pre_idx` actually changed because of the transfer

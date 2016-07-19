@@ -88,7 +88,7 @@ impl BackwardsAnalysis for ComplexEscapeAnalysis {
                                    -> (Option<AnalysisUnit<Self::Facts>>, Self::Facts) {
 
         let fn_id = crate_info.get_fn_node_id(fn_op);
-        let mir_info = crate_info.get_mir_info(&mir_id);
+        let mut mir_info = crate_info.get_mir_info(&mir_id);
 
         let mut new_pre_facts = Facts::empty();
 
@@ -159,12 +159,25 @@ impl BackwardsAnalysis for ComplexEscapeAnalysis {
                     get_arg_paths(&callee_analysis_unit, crate_info, context_and_fn_to_fact_map);
 
                 // Assign the actual arguments to the formal ones.
-                args_and_paths.into_iter().zip(arg_ops).map(|((arg_lval,paths),arg_ops)| {
+                args_and_paths.into_iter().zip(arg_ops).map(|((arg_id,paths),arg_ops)| {
                     let arg_rval = Rvalue::Use(arg_ops.clone());
-                    new_pre_facts.extend(
-                        Self::transfer(mir_info, &paths, &StatementKind::Assign(arg_lval,arg_rval))
-                    )
+                    let tmp_arg_id = mir_info.fresh_var();
+                    let tmp_arg_base_var = BaseVar::Var(tmp_arg_id);
+                    let tmp_arg_lval = Lvalue::Var(tmp_arg_id);
+                    let externed_paths = paths.into_iter().map(|(mut p, u)| {
+                        p.change_base_var(tmp_arg_base_var);
+                        (p, u)
+                    }).collect();
+                    let assignment = StatementKind::Assign(tmp_arg_lval,arg_rval);
+                    mir_info.set_optimistic_alias(true);
+                    let transferred_paths = Self::transfer(mir_info, &externed_paths, &assignment);
+                    mir_info.set_optimistic_alias(false);
+                    let re_interned_paths = transferred_paths.into_iter().filter(|&(ref p, _)|
+                        !p.has_base_var(&tmp_arg_base_var)
+                    );
+                    new_pre_facts.extend(re_interned_paths)
                 }).count();
+
 
                 // Verify that the fn_op didn't produce any facts, nor did the ret_ptr
                 debug_assert_eq!(0, Self::generate(mir_info, Expr::Operand(fn_op)).len());
@@ -209,19 +222,22 @@ impl<'mir,'tcx> AnalysisState<'mir,'tcx,Facts> {
         // Look through all safe exports
         analysis.access_levels.map.iter().filter(|&(id, _)|
             !unsafe_fn_ids.contains(id)
-        ).filter_map(|(id, _)| {
-            self.info.node_id_to_mir(id).and_then(|mir| {
+        ).filter_map(|(fn_nid, _)| {
+            self.info.node_id_to_mir(fn_nid).and_then(|mir| {
+                let mir_info = self.info.get_mir_info(&fn_nid);
                 let start_facts: &Facts = self.context_and_fn_to_fact_map
-                    .get(&(*id, Facts::empty())).unwrap().get(&START_STMT).unwrap();
+                    .get(&(*fn_nid, Facts::empty())).unwrap().get(&START_STMT).unwrap();
                 let concerning_paths: Vec<_> = start_facts.iter().filter_map(|(path, u)| {
-                    if path.of_argument() {
+                    if path.of_argument() &&
+                       mir_info.is_path_exported(&analysis.access_levels, path.as_ref()) {
                         Some(format!("{:?}", path))
                     } else { None }
                 }).collect();
                 if concerning_paths.len() == 0 {
                     None
                 } else {
-                    let fn_name = self.info.tcx.item_path_str(self.info.tcx.map.local_def_id(*id));
+                    let fn_did = self.info.tcx.map.local_def_id(*fn_nid);
+                    let fn_name = self.info.tcx.item_path_str(fn_did);
                     let arguments: Vec<_>= concerning_paths.iter().map(|name|
                         format!("`{}`", name)
                     ).collect();
