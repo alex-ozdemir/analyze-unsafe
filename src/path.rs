@@ -1,5 +1,6 @@
 #![allow(dead_code,unused_imports)]
 use base_var::BaseVar;
+use transfer::CriticalPaths;
 
 use rustc::mir::repr::{CastKind,
                        Constant,
@@ -18,16 +19,20 @@ use rustc::ty::{TypeVariants,
                 TypeAndMut,
                 AdtDefData,
                 TyCtxt,
+                Ty,
 };
+
+use rustc::hir::def_id::DefId;
+use syntax::ast::NodeId;
 
 use rustc_data_structures::indexed_vec::Idx;
 use std::collections::{BTreeSet,BTreeMap};
-use std::fmt::{self,Formatter};
-use std::mem;
+use std::fmt::{self,Formatter,Debug};
+use std::{mem, ptr};
 
 /// A trait for generalized paths: anything that you can add standard projections to (Derefs and
 /// fields). This allows us to write code that works for both types of paths!
-pub trait Projectable : Clone {
+pub trait Projectable : Clone + Debug {
     fn add_projection_in_place(&mut self, p: Projection);
 
     fn last_projection_mut(&mut self) -> Option<&mut Projection>;
@@ -54,8 +59,16 @@ pub trait Projectable : Clone {
         }
     }
 
-    fn tuple_field(mut self, field_idx: usize) -> Self {
+    fn tuple_field_in_place(&mut self, field_idx: usize) {
         self.add_projection_in_place(Projection::Field(0, Some(field_idx)));
+    }
+
+    fn deref_in_place(&mut self) {
+        self.add_projection_in_place(Projection::Deref);
+    }
+
+    fn tuple_field(mut self, field_idx: usize) -> Self {
+        self.tuple_field_in_place(field_idx);
         self
     }
 
@@ -66,32 +79,32 @@ pub trait Projectable : Clone {
 }
 
 #[derive(Hash,PartialEq,Eq,PartialOrd,Ord,Clone)]
-pub struct Path {
+pub struct Path<Base> {
     projections: Vec<Projection>,
-    base: BaseVar,
+    base: Base,
 }
 
 #[derive(Hash,PartialEq,Eq,PartialOrd,Ord,Clone)]
-pub struct PathRef<'a> {
+pub struct PathRef<'a, Base: 'a> {
     pub projections: &'a [Projection],
-    pub base: &'a BaseVar
+    pub base: &'a Base,
 }
 
 //TODO: Rewrite with slice pattterns <3
-#[derive(Clone)]
+#[derive(Clone,Debug)]
 pub enum TmpProjection {
     Proj(Projection),
     Ref,
 }
 
-#[derive(Clone)]
-pub enum TmpPath {
-    Base(BaseVar),
-    Proj(TmpProjection, Box<TmpPath>),
+#[derive(Clone,Debug)]
+pub enum TmpPath<Base> {
+    Base(Base),
+    Proj(TmpProjection, Box<TmpPath<Base>>),
 }
 
-impl From<Path> for TmpPath {
-    fn from(from: Path) -> Self {
+impl<Base: Clone + Eq> From<Path<Base>> for TmpPath<Base> {
+    fn from(from: Path<Base>) -> Self {
         match from.split() {
             (inner, None) => TmpPath::Base(inner.base),
             (inner, Some(proj)) =>
@@ -100,10 +113,10 @@ impl From<Path> for TmpPath {
     }
 }
 
-impl Projectable for TmpPath {
+impl<Base: Clone + Debug> Projectable for TmpPath<Base> {
     fn add_projection_in_place(&mut self, proj: Projection) {
-        let tmp_self = mem::replace(self, TmpPath::Base(BaseVar::Temp(Temp::new(0))));
-        *self = TmpPath::Proj(TmpProjection::Proj(proj), box tmp_self);
+        // TODO: Eliminate copy
+        *self = TmpPath::Proj(TmpProjection::Proj(proj), box self.clone())
     }
 
     fn last_projection_mut(&mut self) -> Option<&mut Projection> {
@@ -119,28 +132,28 @@ impl Projectable for TmpPath {
     }
 }
 
-impl TmpPath {
+impl<Base: Clone + Eq> TmpPath<Base> {
     pub fn add_projection(self, tmp_proj: TmpProjection) -> Self {
         TmpPath::Proj(tmp_proj, box self)
     }
 
-    fn from_base_var(base: BaseVar) -> Self {
+    fn from_base(base: Base) -> Self {
         TmpPath::Base(base)
     }
 
-    pub fn into_path(self) -> Path {
+    pub fn into_path(self) -> Path<Base> {
         use self::TmpPath::*;
         match self {
             Proj(TmpProjection::Ref, _) => bug!("Found a ref when converting TmpPath to Path"),
             Proj(TmpProjection::Proj(proj), box inner) => inner.into_path().add_projection(proj),
-            Base(var) => Path::from_base_var(var),
+            Base(var) => Path::from_base(var),
         }
     }
 
     pub fn reduce_ref_deref(self) -> Self {
         use self::TmpPath::*;
         match self {
-            Base(var) => TmpPath::from_base_var(var),
+            Base(var) => TmpPath::from_base(var),
             Proj(TmpProjection::Proj(Projection::Deref), box Proj(TmpProjection::Ref, box inner))
                 => inner.reduce_ref_deref(),
             Proj(TmpProjection::Proj(Projection::Field(_,_)), box Proj(TmpProjection::Ref, _))
@@ -152,7 +165,7 @@ impl TmpPath {
     }
 }
 
-impl Projectable for Path {
+impl<Base: Clone + Debug> Projectable for Path<Base> {
     fn add_projection_in_place(&mut self, p: Projection) {
         self.projections.push(p);
     }
@@ -162,15 +175,21 @@ impl Projectable for Path {
     }
 }
 
-impl<'a> PathRef<'a> {
+impl<'a, Base> PathRef<'a, Base> {
     pub fn has_indirection(&self) -> bool {
         self.projections.iter().any(|p| p == &Projection::Deref)
     }
 }
 
-impl Path {
+impl<Base: Clone> Path<Base> {
+    pub fn as_ref(&self) -> PathRef<Base> {
+        PathRef{ projections: self.projections.as_slice(), base: &self.base }
+    }
+}
 
-    pub fn new(base: BaseVar, projs: Vec<Projection>) -> Path {
+impl<Base: Clone + Eq> Path<Base> {
+
+    pub fn new(base: Base, projs: Vec<Projection>) -> Path<Base> {
         Path {projections: projs, base: base}
     }
 
@@ -182,21 +201,25 @@ impl Path {
         needs_truncation
     }
 
-    pub fn change_base_var(&mut self, base: BaseVar) {
+    pub fn pop_last(&mut self) -> Option<Projection> {
+        self.projections.pop()
+    }
+
+    pub fn change_base(&mut self, base: Base) {
         self.base = base;
     }
 
-    pub fn from_base_var(base: BaseVar) -> Path {
+    pub fn as_extension(&self) -> &[Projection] {
+        self.projections.as_slice()
+    }
+
+    pub fn from_base(base: Base) -> Path<Base> {
         Path { projections: vec![], base: base }
     }
 
-    pub fn add_projection(mut self, p: Projection) -> Path {
+    pub fn add_projection(mut self, p: Projection) -> Path<Base> {
         self.projections.push(p);
         self
-    }
-
-    pub fn as_ref(&self) -> PathRef {
-        PathRef{ projections: self.projections.as_slice(), base: &self.base }
     }
 
     /// Split the Path into a PathRef and Extension at `idx`.
@@ -204,7 +227,7 @@ impl Path {
     /// ## Panics
     ///
     /// If `idx` is greater than or equal to the number of projections
-    fn split_at(&self, idx: usize) -> (PathRef, &[Projection]) {
+    fn split_at(&self, idx: usize) -> (PathRef<Base>, &[Projection]) {
         let (head, tail) = self.projections.as_slice().split_at(idx);
         let path_ref = PathRef{ projections: head, base: &self.base };
         (path_ref, tail)
@@ -214,11 +237,11 @@ impl Path {
         self.projections.extend_from_slice(extension);
     }
 
-    pub fn sub_paths(&self) -> Vec<(PathRef,&[Projection])> {
+    pub fn sub_paths(&self) -> Vec<(PathRef<Base>,&[Projection])> {
         (0..self.projections.len()).map(|i| self.split_at(i)).collect()
     }
 
-    pub fn strip_highest_deref(mut self) -> Option<Path> {
+    pub fn strip_highest_deref(mut self) -> Option<Path<Base>> {
         let index = self.projections.iter().rposition(|proj| proj.is_deref());
         index.map(|index| {
             self.projections.remove(index);
@@ -226,7 +249,7 @@ impl Path {
         })
     }
 
-    pub fn sub(&self, from: &Path, to: &Path) -> Option<Path> {
+    pub fn sub(&self, from: &Path<Base>, to: &Path<Base>) -> Option<Path<Base>> {
         if self.base == from.base {
             if self.projections.starts_with(from.projections.as_slice()) {
                 let mut new = to.clone();
@@ -241,11 +264,11 @@ impl Path {
         }
     }
 
-    pub fn contains(&self, other: &Path) -> bool {
+    pub fn contains(&self, other: &Path<Base>) -> bool {
         (self.base == other.base) && self.projections.starts_with(other.projections.as_slice())
     }
 
-    pub fn sub_if_possible(self, from: &Path, to: &Path) -> Path {
+    pub fn sub_if_possible(self, from: &Path<Base>, to: &Path<Base>) -> Path<Base> {
         self.sub(from, to).unwrap_or(self)
     }
 
@@ -254,28 +277,43 @@ impl Path {
         (self, proj)
     }
 
-    pub fn has_base_var(&self, base: &BaseVar) -> bool {
+    pub fn has_base(&self, base: &Base) -> bool {
         self.base == *base
     }
 
+    pub fn base(&self) -> &Base {
+        &self.base
+    }
+}
+
+impl Path<BaseVar> {
     pub fn of_argument(&self) -> bool {
         match self.base {
             BaseVar::Arg(_) => true,
             _ => false,
         }
     }
+    pub fn of_return(&self) -> bool {
+        match self.base {
+            BaseVar::ReturnPointer => true,
+            _ => false,
+        }
+    }
+    pub fn may_escape(&self) -> bool {
+        self.of_return() || (self.of_argument() && self.as_ref().has_indirection())
+    }
 }
 
-impl<'a> fmt::Debug for PathRef<'a> {
+impl<'a,Base: Debug> Debug for PathRef<'a,Base> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        for projection in self.projections.iter() {
+        for projection in self.projections.iter().rev() {
             match *projection {
-                Projection::Deref => try!(write!(f, "*(")),
+                Projection::Deref => try!(write!(f, "(*")),
                 Projection::Field(_, _) => try!(write!(f, "(")),
             }
         }
         try!(write!(f, "{:?}", self.base));
-        for projection in self.projections.iter().rev() {
+        for projection in self.projections.iter() {
             match *projection {
                 Projection::Deref => try!(write!(f, ")")),
                 Projection::Field(idx1, idx2) => try!(write!(f, ".{}#{})", idx1, idx2.unwrap())),
@@ -285,7 +323,7 @@ impl<'a> fmt::Debug for PathRef<'a> {
     }
 }
 
-impl fmt::Debug for Path {
+impl<Base: Clone + Debug> Debug for Path<Base> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(f, "{:?}", self.as_ref())
     }
@@ -303,6 +341,60 @@ impl Projection {
             Projection::Deref => true,
             Projection::Field(_, _) => false
         }
+    }
+}
+
+pub fn paths_to_field_acc<'tcx:'mir,'mir,Base: Clone + Eq + Debug>(
+    current: &mut Path<Base>,
+    ty: Ty<'tcx>,
+    field_did: DefId,
+    tcx: TyCtxt<'mir,'tcx,'tcx>
+) -> Vec<Path<Base>> {
+
+    use rustc::ty::TypeVariants::*;
+    match ty.sty {
+        TyBool | TyChar | TyInt(_) | TyUint(_) | TyFloat(_) |
+        TyStr | TyInfer(_) | TyParam(_) | TyError => vec![],
+        TyArray(ty, _) | TySlice(ty) => {
+            paths_to_field_acc(current, ty, field_did, tcx)
+        }
+        TyBox(inner_ty) |
+        TyRawPtr(TypeAndMut{ ty: inner_ty, .. }) |
+        TyRef(_, TypeAndMut{ ty: inner_ty, .. }) => {
+            current.deref_in_place();
+            let out = paths_to_field_acc(current, inner_ty, field_did, tcx);
+            current.pop_last();
+            out
+        }
+        TyEnum(adt_def, substs) |
+        TyStruct(adt_def, substs) => {
+            let mut paths = vec![];
+            for var_idx in 0..(adt_def.variants.len()) {
+                for field_idx in 0..(adt_def.variants[var_idx].fields.len()) {
+                    let field_proj = Projection::Field(var_idx, Some(field_idx));
+                    let ref field = adt_def.variants[var_idx].fields[field_idx];
+                    current.add_projection_in_place(field_proj);
+                    if field.did == field_did {
+                        paths.push(current.clone())
+                    }
+                    let t = field.ty(tcx, substs);
+                    paths.extend(paths_to_field_acc(current, t, field_did, tcx));
+                    current.pop_last();
+                }
+            }
+            paths
+        }
+        TyTuple(ref ts) => {
+            let mut paths = vec![];
+            for idx in 0..(ts.len()) {
+                let ty = ts[idx];
+                current.tuple_field_in_place(idx);
+                paths.extend(paths_to_field_acc(current, ty, field_did, tcx));
+                current.pop_last();
+            }
+            paths
+        }
+        TyClosure(_, _) | TyProjection(_) | TyTrait(_) | TyFnDef(_, _, _) | TyFnPtr(_) => vec![],
     }
 }
 

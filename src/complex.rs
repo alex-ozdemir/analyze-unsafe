@@ -1,7 +1,10 @@
-use backflow::{BackwardsAnalysis,
+use backflow::{AnalysisUnit,
+               BackwardsAnalysis,
                CrateInfo,
                CrateFactsMap,
                Expr,
+               Context,
+               Facts,
                get_unsafe_fn_ids,
                MIRInfo,
                START_STMT,
@@ -12,12 +15,15 @@ use rustc::mir::repr::{Lvalue,
                        Operand,
                        StatementKind,
                        Var,
+                       Arg,
 };
+
+use rustc::hir::def_id::DefId;
 
 use rustc::hir;
 use rustc::ty::{self, TypeVariants};
 
-use path::Path;
+use path::{Path,paths_to_field_acc};
 
 use transfer::{transfer,
                join,
@@ -26,7 +32,7 @@ use transfer::{transfer,
                gen_by_lvalue,
                gen_by_rvalue,
                gen_by_operand,
-               Facts,
+               CriticalPaths,
                CriticalUse,
 };
 
@@ -37,10 +43,12 @@ use syntax::codemap::Span;
 
 use backflow::{
     AnalysisState,
-    AnalysisUnit,
+    RawAnalysisUnit,
 };
 
 use std::collections::{BTreeSet,HashSet};
+
+use std::fmt::Debug;
 
 use std::io::Write;
 macro_rules! errln(
@@ -52,8 +60,15 @@ macro_rules! errln(
 
 pub struct ComplexEscapeAnalysis;
 
+impl<Base: Clone + Ord + Debug> Facts for CriticalPaths<Base> {
+    fn join(&self, right: &Self) -> Self {
+        join(self, right)
+    }
+}
+
 impl BackwardsAnalysis for ComplexEscapeAnalysis {
-    type Facts = Facts;
+    type Facts = CriticalPaths<BaseVar>;
+    type GlobalFacts = CriticalPaths<DefId>;
 
     // The base variables which are made critical by this expression
     fn generate<'a, 'b, 'tcx: 'a + 'b + 'mir, 'mir, 'gcx: 'tcx>(
@@ -75,9 +90,27 @@ impl BackwardsAnalysis for ComplexEscapeAnalysis {
         transfer(mir_info, statement, post_facts)
     }
 
-    fn join(left: &Self::Facts, right: &Self::Facts) -> Self::Facts {
-        join(left, right)
+    fn substantiate_au<'mir,'tcx>(
+        state: &mut AnalysisState<Self::Facts,Self::GlobalFacts>,
+        (fn_nid, cx): AnalysisUnit<Self::Facts>
+    ) -> RawAnalysisUnit<Self::Facts> {
+        match cx {
+            Context::User => {
+                let mut critical_paths = CriticalPaths::empty();
+                for (ref field_path, ref criticalness) in state.user_cx.iter() {
+                    let mir_info = state.info.get_mir_info(&fn_nid);
+                    for mut path_to_field in paths_to_field(mir_info, field_path.base().clone()) {
+                        path_to_field.extend_in_place(field_path.as_extension());
+                        critical_paths.insert(path_to_field, (*criticalness).clone())
+                    }
+                }
+                (fn_nid, critical_paths)
+            },
+            Context::Internal(critical_paths) => (fn_nid, critical_paths),
+        }
     }
+
+
     fn fn_call_transfer<'mir,'tcx>(mir_id: NodeId,
                                    crate_info: &CrateInfo<'mir,'tcx>,
                                    context_and_fn_to_fact_map: &CrateFactsMap<Self::Facts>,
@@ -85,12 +118,12 @@ impl BackwardsAnalysis for ComplexEscapeAnalysis {
                                    fn_op: &Operand<'tcx>,
                                    arg_ops: &Vec<Operand<'tcx>>,
                                    dest: &Lvalue<'tcx>)
-                                   -> (Option<AnalysisUnit<Self::Facts>>, Self::Facts) {
+                                   -> (Option<RawAnalysisUnit<Self::Facts>>, Self::Facts) {
 
         let fn_id = crate_info.get_fn_node_id(fn_op);
         let mut mir_info = crate_info.get_mir_info(&mir_id);
 
-        let mut new_pre_facts = Facts::empty();
+        let mut new_pre_facts = CriticalPaths::empty();
 
         // Do `dest = ret`, where `ret` stands in for the return of the callee.
         // Split the resulting facts by whether they involve the return.
@@ -103,20 +136,21 @@ impl BackwardsAnalysis for ComplexEscapeAnalysis {
         let callee_info = crate_info.get_mir_info(&mir_id);
         let (mut facts_at_end_of_callee, dont_involve_ret): (Self::Facts,_) =
             Self::transfer(callee_info, post_facts, &assign_from_ret).into_iter()
-                .partition(|&(ref p,_)| p.has_base_var(&fresh_base_var));
+                .partition(|&(ref p,_)| p.has_base(&fresh_base_var));
 
-        let facts_at_end_of_callee: Facts = facts_at_end_of_callee.into_iter().map(|(mut p, u)| {
-            p.change_base_var(BaseVar::ReturnPointer);
-            (p, u)
-        }).collect();
+        let facts_at_end_of_callee: CriticalPaths<BaseVar> =
+            facts_at_end_of_callee.into_iter().map(|(mut p, u)| {
+                p.change_base(BaseVar::ReturnPointer);
+                (p, u)
+            }).collect();
 
-        // Facts uninvolved with the return flow around the fn-call.
+        // CriticalPaths uninvolved with the return flow around the fn-call.
         new_pre_facts.extend(dont_involve_ret.into_iter());
 
         match fn_id {
             None => {
                 let def_id = crate_info.get_fn_def_id(fn_op);
-                let mir = crate_info.mir_map.map.get(&mir_id).unwrap();
+                let mir = crate_info.get_mir(&mir_id);
                 let is_unsafe = match def_id {
                     Some(def_id) => {
                         if crate_info.get_fn_node_id(fn_op).is_none() {
@@ -152,7 +186,8 @@ impl BackwardsAnalysis for ComplexEscapeAnalysis {
             },
             Some(id) => {
                 // Determine the analysis unit for the callee.
-                let callee_analysis_unit = (id, facts_at_end_of_callee.into_iter().collect());
+                let raw_context = facts_at_end_of_callee.into_iter().collect();
+                let callee_analysis_unit = (id, raw_context);
 
                 // Lookup the facts for the AU's formal arguments.
                 let args_and_paths =
@@ -165,7 +200,7 @@ impl BackwardsAnalysis for ComplexEscapeAnalysis {
                     let tmp_arg_base_var = BaseVar::Var(tmp_arg_id);
                     let tmp_arg_lval = Lvalue::Var(tmp_arg_id);
                     let externed_paths = paths.into_iter().map(|(mut p, u)| {
-                        p.change_base_var(tmp_arg_base_var);
+                        p.change_base(tmp_arg_base_var);
                         (p, u)
                     }).collect();
                     let assignment = StatementKind::Assign(tmp_arg_lval,arg_rval);
@@ -173,7 +208,7 @@ impl BackwardsAnalysis for ComplexEscapeAnalysis {
                     let transferred_paths = Self::transfer(mir_info, &externed_paths, &assignment);
                     mir_info.set_optimistic_alias(false);
                     let re_interned_paths = transferred_paths.into_iter().filter(|&(ref p, _)|
-                        !p.has_base_var(&tmp_arg_base_var)
+                        !p.has_base(&tmp_arg_base_var)
                     );
                     new_pre_facts.extend(re_interned_paths)
                 }).count();
@@ -190,27 +225,44 @@ impl BackwardsAnalysis for ComplexEscapeAnalysis {
         // Generate ...
     }
 
+    fn extract_global_facts<'a, 'mir, 'gcx: 'tcx, 'tcx: 'mir + 'a>(
+        entry_facts: &Self::Facts,
+        mir_info: MIRInfo<'a, 'mir, 'tcx, 'gcx>
+    ) -> Self::GlobalFacts {
+        let mut paths = CriticalPaths::empty();
+        for (path, criticalness) in entry_facts.iter() {
+            if path.may_escape() {
+                if let Some(field_path) = mir_info.path_from_private(path.as_ref()) {
+                    println!("    Private path {:?} in {:?}", field_path, path);
+                    paths.insert(field_path, criticalness.clone());
+                }
+            }
+        }
+        paths
+    }
+
 }
 
-fn get_arg_paths<'mir,'tcx>(context: &AnalysisUnit<Facts>,
+fn get_arg_paths<'mir,'tcx>(raw_au: &RawAnalysisUnit<CriticalPaths<BaseVar>>,
                             crate_info: &CrateInfo<'mir,'tcx>,
-                            context_and_fn_to_fact_map: &CrateFactsMap<Facts>
-    ) -> Vec<(Lvalue<'tcx>,Facts)> {
-    let empty = Facts::empty();
-    let start_facts = context_and_fn_to_fact_map.get(context)
+                            context_and_fn_to_fact_map: &CrateFactsMap<CriticalPaths<BaseVar>>
+    ) -> Vec<(Lvalue<'tcx>,CriticalPaths<BaseVar>)> {
+    let au = (raw_au.0.clone(), Context::Internal(raw_au.1.clone()));
+    let empty = CriticalPaths::empty();
+    let start_facts = context_and_fn_to_fact_map.get(&au)
         .and_then(|m| m.get(&START_STMT)).unwrap_or(&empty);
-    let ref arg_decls = crate_info.mir_map.map.get(&context.0).unwrap().arg_decls;
+    let ref arg_decls = crate_info.mir_map.map.get(&raw_au.0).unwrap().arg_decls;
     arg_decls.indices().map(|arg_id| {
         let arg = BaseVar::Arg(arg_id);
         let arg_facts = start_facts.iter()
-            .filter(|&(path, u)| path.has_base_var(&arg))
+            .filter(|&(path, u)| path.has_base(&arg))
             .map(|(path,u)| (path.clone(), u.clone())).collect();
         (Lvalue::Arg(arg_id), arg_facts)
 
     }).collect()
 }
 
-impl<'mir,'tcx> AnalysisState<'mir,'tcx,Facts> {
+impl<'mir,'tcx> AnalysisState<'mir,'tcx,CriticalPaths<BaseVar>,CriticalPaths<DefId>> {
 
     /// Produces a list of (Span, Error Message) pairs.
     pub fn get_lints(&self,
@@ -225,11 +277,12 @@ impl<'mir,'tcx> AnalysisState<'mir,'tcx,Facts> {
         ).filter_map(|(fn_nid, _)| {
             self.info.node_id_to_mir(fn_nid).and_then(|mir| {
                 let mir_info = self.info.get_mir_info(&fn_nid);
-                let start_facts: &Facts = self.context_and_fn_to_fact_map
-                    .get(&(*fn_nid, Facts::empty())).unwrap().get(&START_STMT).unwrap();
+                let start_facts: &CriticalPaths<BaseVar> = self.context_and_fn_to_fact_map
+                    .get(&(*fn_nid, Context::User))
+                    .unwrap().get(&START_STMT).unwrap();
                 let concerning_paths: Vec<_> = start_facts.iter().filter_map(|(path, u)| {
                     if path.of_argument() &&
-                       mir_info.is_path_exported(&analysis.access_levels, path.as_ref()) {
+                       mir_info.is_path_exported(path.as_ref()) {
                         Some(format!("{:?}", path))
                     } else { None }
                 }).collect();
@@ -253,3 +306,20 @@ impl<'mir,'tcx> AnalysisState<'mir,'tcx,Facts> {
         }).collect()
     }
 }
+
+pub fn paths_to_field<'a, 'mir, 'gcx: 'tcx, 'tcx: 'mir + 'a>(
+    mir_info: MIRInfo<'a, 'mir, 'tcx, 'gcx>,
+    field_did: DefId)
+    -> Vec<Path<BaseVar>>
+{
+    let mut paths : Vec<Path<BaseVar>> = mir_info.args_and_tys().into_iter().flat_map(|(arg_id, ty)| {
+        paths_to_field_acc(&mut Path::from_base(BaseVar::Arg(arg_id)), ty, field_did, mir_info.tcx())
+    }).collect();
+    paths.retain(|path| path.as_ref().has_indirection());
+    paths.extend(paths_to_field_acc(&mut Path::from_base(BaseVar::ReturnPointer),
+                                    mir_info.lvalue_ty(&Lvalue::ReturnPointer),
+                                    field_did,
+                                    mir_info.tcx()));
+    paths
+}
+

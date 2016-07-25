@@ -18,6 +18,7 @@ use rustc::mir::repr::{BasicBlock,
                        StatementKind,
                        TerminatorKind,
                        Var,
+                       Arg,
 };
 
 use base_var::BaseVar;
@@ -39,7 +40,7 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::iter::{self,IntoIterator};
 
-use path::PathRef;
+use path::{Path,PathRef};
 
 use std::io::Write;
 macro_rules! errln(
@@ -61,9 +62,10 @@ pub const START_STMT: StatementIdx = StatementIdx(START_BLOCK, 0);
 pub enum Context<Facts> {
     /// This indicates the context which could exist when the function is called by the user. It is
     /// influence by the private fields which have been made critical.
-    UserCx,
-    InternalCx(Facts),
+    User,
+    Internal(Facts),
 }
+pub type RawContext<Facts> = Facts;
 pub type MIRFactsMap<Facts> = BTreeMap<StatementIdx,Facts>;
 pub type CrateFactsMap<Facts> = BTreeMap<AnalysisUnit<Facts>,MIRFactsMap<Facts>>;
 
@@ -71,6 +73,7 @@ pub type CrateFactsMap<Facts> = BTreeMap<AnalysisUnit<Facts>,MIRFactsMap<Facts>>
 pub struct MIRInfo<'a, 'mir, 'gcx: 'tcx, 'tcx: 'mir + 'a>{
     mir: &'a Mir<'tcx>,
     tcx: TyCtxt<'mir, 'gcx, 'tcx>,
+    access_levels: &'a AccessLevels,
     /// This flag indicates whether MIRInfo should skip the sound alias analysis in favor of an
     /// optimistic one (all distinct paths not may alias).
     ///
@@ -85,18 +88,18 @@ pub struct MIRInfo<'a, 'mir, 'gcx: 'tcx, 'tcx: 'mir + 'a>{
 }
 
 impl<'a, 'mir, 'gcx, 'tcx> MIRInfo<'a, 'mir, 'gcx, 'tcx> {
-    pub fn lvalue_ty(&self, lvalue: &Lvalue<'tcx>) -> &TypeVariants<'tcx> {
-        &self.mir.lvalue_ty(self.tcx, lvalue).to_ty(self.tcx).sty
+    pub fn lvalue_ty(&self, lvalue: &Lvalue<'tcx>) -> Ty<'tcx> {
+        &self.mir.lvalue_ty(self.tcx, lvalue).to_ty(self.tcx)
     }
 
     pub fn is_raw_ptr(&self, lvalue: &Lvalue<'tcx>) -> bool {
-        if let &TypeVariants::TyRawPtr(_) = self.lvalue_ty(lvalue) {
+        if let TypeVariants::TyRawPtr(_) = self.lvalue_ty(lvalue).sty {
             true
         } else { false }
     }
 
     pub fn is_ref(&self, lvalue: &Lvalue<'tcx>) -> bool {
-        if let &TypeVariants::TyRef(_,_) = self.lvalue_ty(lvalue) {
+        if let TypeVariants::TyRef(_,_) = self.lvalue_ty(lvalue).sty {
             true
         } else { false }
     }
@@ -106,11 +109,13 @@ impl<'a, 'mir, 'gcx, 'tcx> MIRInfo<'a, 'mir, 'gcx, 'tcx> {
     }
 
     #[allow(unused_variables)]
-    pub fn singular(&self, p1: PathRef) -> bool { false }
+    pub fn singular(&self, p1: PathRef<BaseVar>) -> bool { false }
 
-    pub fn must_alias<'b>(&self, p1: PathRef<'b>, p2: PathRef<'b>) -> bool { p1 == p2 }
+    pub fn must_alias<'b>(&self, p1: PathRef<'b, BaseVar>, p2: PathRef<'b, BaseVar>) -> bool {
+        p1 == p2
+    }
 
-    pub fn may_alias<'b>(&self, p1: PathRef<'b>, p2: PathRef<'b>) -> bool {
+    pub fn may_alias<'b>(&self, p1: PathRef<'b, BaseVar>, p2: PathRef<'b, BaseVar>) -> bool {
         if !self.optimistic_alias {
             p1 == p2
             || (
@@ -123,9 +128,11 @@ impl<'a, 'mir, 'gcx, 'tcx> MIRInfo<'a, 'mir, 'gcx, 'tcx> {
     }
 
     // TODO!
-    pub fn may_reach<'b>(&self, p1: PathRef<'b>, p2: PathRef<'b>) -> bool { p1 == p2 }
+    pub fn may_reach<'b>(&self, p1: PathRef<'b, BaseVar>, p2: PathRef<'b, BaseVar>) -> bool {
+        p1 == p2
+    }
 
-    pub fn path_ty(&self, p1: PathRef) -> Ty<'tcx> {
+    pub fn path_ty(&self, p1: PathRef<BaseVar>) -> Ty<'tcx> {
         use path::Projection::*;
         use rustc::ty::TypeVariants::*;
         let mut ty = Self::narrow_to_single_ty(self.base_var_ty(p1.base));
@@ -161,13 +168,13 @@ impl<'a, 'mir, 'gcx, 'tcx> MIRInfo<'a, 'mir, 'gcx, 'tcx> {
                 }
             }
         }
-        errln!("      Path {:?} has type {:?}", p1, ty);
+        //errln!("      Path {:?} has type {:?}", p1, ty);
         ty
     }
 
     /// Returns true if the indicated PathRef corresponds to a publically visible location.
     /// Public fields of exported structures count, as do primitive types, but nothing else does.
-    pub fn is_path_exported(&self, access_levels: &AccessLevels, p1: PathRef) -> bool {
+    pub fn is_path_exported(&self, p1: PathRef<BaseVar>) -> bool {
         use path::Projection::*;
         use rustc::ty::TypeVariants::*;
         let mut ty = Self::narrow_to_single_ty(self.base_var_ty(p1.base));
@@ -179,28 +186,33 @@ impl<'a, 'mir, 'gcx, 'tcx> MIRInfo<'a, 'mir, 'gcx, 'tcx> {
                                 bug!("Path {:?} deref'd the type {:?}", p1, ty)
                             }).ty
                 }
-                &Field(ref variant_idx, None) => {
+                &Field(variant_idx, None) => {
                     let not_exported = match ty.sty {
-                        TyEnum(ref adt_def, _) => self.tcx.map.as_local_node_id(adt_def.did)
-                            .map(|node_id| access_levels.is_reachable(node_id))
-                            .unwrap_or(false),
+                        TyEnum(ref adt_def, _) => {
+                            let ref variant = adt_def.variants[variant_idx];
+                            self.tcx.map.as_local_node_id(variant.did)
+                            .map(|node_id| !self.access_levels.is_reachable(node_id))
+                            .unwrap_or(false)
+                        },
                         _ => { bug!("Path {:?} _just_ downcasts the type {:?}, with variant {}",
                                     p1,
                                     ty,
                                     variant_idx); },
                     };
-                    if not_exported { return false; }
+                    if not_exported { bug!("Variant is not exported!") }
                 },
                 &Field(variant_idx, Some(field_idx)) => {
                     ty = match ty.sty {
                         TyTuple(ref inner_tys) if variant_idx == 0 => inner_tys[field_idx],
                         TyStruct(ref adt_def, ref substs) |
                         TyEnum(ref adt_def, ref substs) => {
-                            let not_exported = self.tcx.map.as_local_node_id(adt_def.did)
-                                .map(|node_id| access_levels.is_reachable(node_id))
+                            let ref variant = adt_def.variants[variant_idx];
+                            let not_exported = self.tcx.map.as_local_node_id(variant.did)
+                                .map(|node_id| !self.access_levels.is_reachable(node_id))
                                 .unwrap_or(false);
                             if not_exported {
-                                return false;
+                                bug!("Variant is not exported! {:?}, ty {:?}, var {:?}",
+                                     p1, ty, variant.did);
                             }
                             let ref field = adt_def.variants[variant_idx].fields[field_idx];
                             if field.vis != ty::Visibility::Public {
@@ -220,6 +232,70 @@ impl<'a, 'mir, 'gcx, 'tcx> MIRInfo<'a, 'mir, 'gcx, 'tcx> {
         return true;
     }
 
+    /// If this path has a private field in it, takes the extension from the private field to make
+    /// a new path.
+    pub fn path_from_private(&self, p1: PathRef<BaseVar>) -> Option<Path<DefId>> {
+        use path::Projection::*;
+        use rustc::ty::TypeVariants::*;
+        let mut ty = Self::narrow_to_single_ty(self.base_var_ty(p1.base));
+        for projection_idx in 0..(p1.projections.len()) {
+            let ref projection = p1.projections[projection_idx];
+            match projection {
+                &Deref => {
+                    ty = ty.builtin_deref(true, ty::LvaluePreference::NoPreference)
+                           .unwrap_or_else(|| {
+                                bug!("Path {:?} deref'd the type {:?}", p1, ty)
+                            }).ty
+                },
+                &Field(variant_idx, None) => {
+                    let not_exported = match ty.sty {
+                        TyEnum(ref adt_def, _) => {
+                            let ref variant = adt_def.variants[variant_idx];
+                            self.tcx.map.as_local_node_id(variant.did)
+                            .map(|node_id| !self.access_levels.is_reachable(node_id))
+                            .unwrap_or(false)
+                        },
+                        _ => { bug!("Path {:?} _just_ downcasts the type {:?}, with variant {}",
+                                    p1,
+                                    ty,
+                                    variant_idx); },
+                    };
+                    if not_exported { bug!("Variant is not exported!") }
+                },
+                &Field(variant_idx, Some(field_idx)) => {
+                    ty = match ty.sty {
+                        TyTuple(ref inner_tys) if variant_idx == 0 => inner_tys[field_idx],
+                        TyStruct(ref adt_def, ref substs) |
+                        TyEnum(ref adt_def, ref substs) => {
+                            let ref variant = adt_def.variants[variant_idx];
+                            let not_exported = self.tcx.map.as_local_node_id(variant.did)
+                                .map(|node_id| !self.access_levels.is_reachable(node_id))
+                                .unwrap_or(false);
+                            if not_exported {
+                                bug!("Variant is not exported! {:?}, ty {:?}, var {:?}",
+                                     p1, ty, variant.did);
+                            }
+                            let ref field = variant.fields[field_idx];
+                            if field.vis != ty::Visibility::Public {
+                                let mut field_path = Path::from_base(field.did);
+                                let extension = p1.projections.split_at(projection_idx+1).1;
+                                field_path.extend_in_place(extension);
+                                return Some(field_path);
+                            }
+                            field.ty(self.tcx, substs)
+                        },
+                        _ => bug!("Path {:?} specifies field ({},{}) of type {:?}",
+                                  p1,
+                                  variant_idx,
+                                  field_idx,
+                                  ty),
+                    }
+                }
+            }
+        }
+        return None;
+    }
+
     /// This function reduces array and slice types (collection types) to their component type. The
     /// reason we do this is the analysis does not record slice / index projections in the paths.
     /// Thus, when considering a path `*p` on a `p` with type [*const T], we need to skip over the
@@ -235,16 +311,26 @@ impl<'a, 'mir, 'gcx, 'tcx> MIRInfo<'a, 'mir, 'gcx, 'tcx> {
     fn base_var_ty(&self, base: &BaseVar) -> Ty<'tcx> {
         use base_var::BaseVar::*;
         match base {
-            &Var(var) => self.mir.lvalue_ty(self.tcx, &Lvalue::Var(var)).to_ty(self.tcx),
-            &Temp(temp) => self.mir.lvalue_ty(self.tcx, &Lvalue::Temp(temp)).to_ty(self.tcx),
-            &Arg(arg) => self.mir.lvalue_ty(self.tcx, &Lvalue::Arg(arg)).to_ty(self.tcx),
-            &Static(def_id) => self.mir.lvalue_ty(self.tcx, &Lvalue::Static(def_id)).to_ty(self.tcx),
-            &ReturnPointer => self.mir.lvalue_ty(self.tcx, &Lvalue::ReturnPointer).to_ty(self.tcx),
+            &Var(var) => self.lvalue_ty(&Lvalue::Var(var)),
+            &Temp(temp) => self.lvalue_ty(&Lvalue::Temp(temp)),
+            &Arg(arg) => self.lvalue_ty(&Lvalue::Arg(arg)),
+            &Static(def_id) => self.lvalue_ty(&Lvalue::Static(def_id)),
+            &ReturnPointer => self.lvalue_ty(&Lvalue::ReturnPointer),
         }
     }
 
     pub fn fresh_var(&self) -> Var {
         Var::new(self.mir.var_decls.len())
+    }
+
+    pub fn args_and_tys(&self) -> Vec<(Arg,Ty<'tcx>)> {
+        self.mir.arg_decls.iter_enumerated()
+            .map(|(arg_id, arg_decl)| (arg_id, arg_decl.ty))
+            .collect()
+    }
+
+    pub fn tcx(&self) -> TyCtxt<'mir, 'tcx, 'gcx> {
+        self.tcx
     }
 }
 
@@ -253,20 +339,33 @@ pub struct CrateInfo<'mir,'tcx:'mir> {
     // The MIRs for the crate
     pub mir_map: &'mir MirMap<'tcx>,
 
+    // The privacy status of items
+    pub access_levels: AccessLevels,
+
     // The Type Context, also includes the map from DefId's to NodeId's
     pub tcx: ty::TyCtxt<'mir,'tcx,'tcx>,
 }
 
 impl<'mir, 'tcx> CrateInfo<'mir, 'tcx> {
-    pub fn get_mir_info(&self, mir_id: &NodeId) -> MIRInfo<'mir, 'mir, 'tcx, 'tcx> {
-        let mir = self.mir_map.map.get(mir_id).expect("CrateInfo created for an invalid MIRID");
-        MIRInfo{ mir: mir, tcx: self.tcx.clone(), optimistic_alias: false }
+    pub fn get_mir_info<'a>(&'a self, mir_id: &NodeId) -> MIRInfo<'a, 'mir, 'tcx, 'tcx> {
+        let mir = self.get_mir(mir_id);
+        let ref access_levels = self.access_levels;
+        MIRInfo {
+            mir: mir,
+            tcx: self.tcx.clone(),
+            optimistic_alias: false,
+            access_levels: access_levels,
+        }
+    }
+    pub fn get_mir(&self, mir_id: &NodeId) -> &Mir<'tcx> {
+        self.mir_map.map.get(mir_id).expect("CrateInfo created for an invalid MIRID")
     }
 }
 
 pub type AnalysisUnit<Facts> = (NodeId, Context<Facts>);
+pub type RawAnalysisUnit<Facts> = (NodeId, RawContext<Facts>);
 
-pub struct AnalysisState<'mir,'tcx:'mir,Facts> {
+pub struct AnalysisState<'mir,'tcx:'mir,Facts,GlobalFacts> {
     // Holds the fact map for each MIR, in each context
     pub context_and_fn_to_fact_map: CrateFactsMap<Facts>,
 
@@ -277,7 +376,8 @@ pub struct AnalysisState<'mir,'tcx:'mir,Facts> {
     pub info: CrateInfo<'mir,'tcx>,
 
     // Info about which private fields are currently critical
-    
+    // While the range is technically Facts, the base_variable actually doesn't matter.
+    pub user_cx: GlobalFacts,
 }
 
 /// The WorkQueue data structure not only provides a queue of analyses (MIR,CX) to run, it also
@@ -296,19 +396,23 @@ pub struct WorkQueue<Facts> {
     /// A set of all things that have been enqueue. Relevant because the first time something is
     /// entered it's flow source should be all returns.
     entered: HashSet<AnalysisUnit<Facts>>,
+
+    /// A list of the functions in the crate
+    functions: Vec<NodeId>,
 }
 
 
 impl<Facts: Hash + Eq + Clone> WorkQueue<Facts> {
 
-    pub fn new<I: Iterator<Item=AnalysisUnit<Facts>>>(iter: I) -> WorkQueue<Facts> {
+    pub fn new<I: Iterator<Item=NodeId>>(functions: I) -> WorkQueue<Facts> {
         let mut q = WorkQueue {
             deps: KeyedDepGraph::new(),
             queue: VecDeque::new(),
             map: HashMap::new(),
             entered: HashSet::new(),
+            functions: functions.collect(),
         };
-        iter.map(|au| q.enqueue_many(au, iter::once(START_BLOCK))).count();
+        q.enqueue_user_cxs();
         q
     }
 
@@ -368,6 +472,20 @@ impl<Facts: Hash + Eq + Clone> WorkQueue<Facts> {
         }
     }
 
+    pub fn enqueue_user_cxs(&mut self) {
+        let fns = self.functions.clone();
+        fns.iter().map(|other_id| self.enqueue_user_cx(other_id)).count();
+    }
+
+    fn enqueue_user_cx(&mut self, fn_nid: &NodeId) {
+        let au = (*fn_nid, Context::User);
+        if !self.map.contains_key(&au) {
+            self.map.insert(au.clone(), FlowSource::Returns);
+            self.queue.push_back(au.clone());
+            self.entered.insert(au);
+        }
+    }
+
     pub fn get(&mut self) -> Option<WorkItem<Facts>> {
         self.queue.pop_back().map( |au| {
             let source = self.map.remove(&au).unwrap();
@@ -391,23 +509,32 @@ pub enum FlowSource {
     Blocks(HashSet<BasicBlock>),
 }
 
-impl<'mir,'tcx, Facts: Eq + Hash + Ord + Default + Clone> AnalysisState<'mir,'tcx,Facts> {
-    fn new(mir_map: &'mir MirMap<'tcx>, tcx: ty::TyCtxt<'mir,'tcx,'tcx>)
-           -> AnalysisState<'mir,'tcx,Facts> {
+impl<'mir,'tcx, Facts, GlobalFacts> AnalysisState<'mir,'tcx,Facts,GlobalFacts>
+    where Facts: Ord + Hash + Clone,
+          GlobalFacts: Default {
+    fn new(
+       mir_map: &'mir MirMap<'tcx>,
+       tcx: ty::TyCtxt<'mir,'tcx,'tcx>,
+       access_levels: AccessLevels
+    ) -> AnalysisState<'mir,'tcx,Facts,GlobalFacts> {
         AnalysisState {
             context_and_fn_to_fact_map: BTreeMap::new(),
-            info: CrateInfo::new(mir_map, tcx),
-            queue: WorkQueue::new(mir_map.map.keys().map(|id| (*id, Facts::default()))),
+            info: CrateInfo::new(mir_map, tcx, access_levels),
+            queue: WorkQueue::new(mir_map.map.keys().map(|id| *id)),
+            user_cx: GlobalFacts::default(),
         }
     }
 }
 
 impl<'mir,'tcx> CrateInfo<'mir,'tcx> {
-    fn new(mir_map: &'mir MirMap<'tcx>, tcx: ty::TyCtxt<'mir,'tcx,'tcx>)
-           -> CrateInfo<'mir,'tcx> {
+    fn new(mir_map: &'mir MirMap<'tcx>,
+           tcx: ty::TyCtxt<'mir,'tcx,'tcx>,
+           access_levels: AccessLevels
+    ) -> CrateInfo<'mir,'tcx> {
         CrateInfo {
             mir_map: mir_map,
             tcx: tcx,
+            access_levels: access_levels
         }
     }
 
@@ -442,8 +569,19 @@ pub enum Expr<'a, 'tcx: 'a> {
     Operand(&'a Operand<'tcx>)
 }
 
+pub trait Facts : Default {
+    // Produces the set of facts before a forward split in the CFG.
+    fn join(&self, right: &Self) -> Self;
+
+    fn join_many(many: Vec<&Self>) -> Self {
+        many.into_iter().fold(Self::default(), |acc, item| acc.join(item))
+    }
+}
+
 pub trait BackwardsAnalysis {
-    type Facts: PartialEq + Eq + Hash + Debug + PartialOrd + Ord + Default + Clone;
+    //TODO: need so many bounds?
+    type Facts: Hash + Debug + Ord + Default + Clone + Facts;
+    type GlobalFacts: Debug + Clone + Eq + Facts;
     // The facts which are made by evaluating this expression. Comes up during some terminators.
     fn generate<'a, 'b, 'tcx: 'a + 'b + 'mir, 'mir, 'gcx: 'tcx>
         (mir_info: MIRInfo<'b, 'mir, 'gcx, 'tcx>, expr: Expr<'a, 'tcx>) -> Self::Facts;
@@ -454,33 +592,30 @@ pub trait BackwardsAnalysis {
                                            statement: &StatementKind<'tcx>)
                                            -> Self::Facts;
 
-    // Produces the set of facts before a forward split in the CFG.
-    fn join(left: &Self::Facts, right: &Self::Facts) -> Self::Facts;
-
-    fn join_many(many: Vec<&Self::Facts>) -> Self::Facts {
-        many.into_iter().fold(Self::Facts::default(), |acc, item| Self::join(&acc, item))
-    }
 
     fn flow<'mir,'tcx>(mir_map: &'mir MirMap<'tcx>,
-                       tcx: ty::TyCtxt<'mir,'tcx,'tcx>)
-                       -> AnalysisState<'mir,'tcx,Self::Facts> {
-        let mut state = AnalysisState::new(mir_map, tcx);
+                       tcx: ty::TyCtxt<'mir,'tcx,'tcx>,
+                       access_levels: AccessLevels)
+                       -> AnalysisState<'mir,'tcx,Self::Facts,Self::GlobalFacts> {
+        let mut state = AnalysisState::new(mir_map, tcx, access_levels);
         while let Some(work_item) = state.queue.get() {
             Self::flow_work_item(work_item, &mut state);
         }
         state
     }
 
-    fn substatiate_au<'mir,'tcx>(
-        state: &mut AnalysisState<Self::Facts>,
+    fn substantiate_au<'mir,'tcx>(
+        state: &mut AnalysisState<Self::Facts,Self::GlobalFacts>,
         au: AnalysisUnit<Self::Facts>
-    ) {
+    ) -> RawAnalysisUnit<Self::Facts>;
 
     /// Flows till convergence on a single (MIR,CX) - just looks up the results of other functions.
     /// Manipulates the state - changing (MIR,CX) dependencies and the queue.
+    ///
+    /// ## Returns
     fn flow_work_item<'mir,'tcx>(
         work_item: WorkItem<Self::Facts>,
-        state: &mut AnalysisState<Self::Facts>
+        state: &mut AnalysisState<Self::Facts,Self::GlobalFacts>
     ) {
 
         // If the terminator just evaluates an expression (no assignment), this produces that
@@ -499,10 +634,13 @@ pub trait BackwardsAnalysis {
             }
         }
         let WorkItem(mir_id, context, flow_source) = work_item;
-        let au = (mir_id, context.clone());
+        let true_au = (mir_id, context);
+        let raw_au = Self::substantiate_au(state, true_au.clone());
+        let cx_paths = raw_au.1.clone();
         let mir = state.info.mir_map.map.get(&mir_id).unwrap();
-        println!("Pulling full ctx {:?}", au);
-        let mut mir_facts = state.context_and_fn_to_fact_map.remove(&au)
+        let mir_info = state.info.get_mir_info(&mir_id);
+        println!("Pulling full ctx {:?}", true_au);
+        let mut mir_facts = state.context_and_fn_to_fact_map.remove(&true_au)
             .unwrap_or(BTreeMap::new());
 
         // Initialize work queue with Basic Blocks from the flow source
@@ -555,8 +693,9 @@ pub trait BackwardsAnalysis {
                     if let Some(dep) = maybe_dependency {
                         println!("    Dependency on {:?}, from {:?}", dep, bb_idx);
                         // We don't want to register dependencies on ourselves.
-                        if dep != au {
-                            state.queue.register_dependency(&au, dep, bb_idx);
+                        let dep = (dep.0, Context::Internal(dep.1));
+                        if dep != true_au {
+                            state.queue.register_dependency(&true_au, dep, bb_idx);
                         }
                     }
 
@@ -567,7 +706,7 @@ pub trait BackwardsAnalysis {
                     mir_facts.insert(pre_idx, new_pre_facts);
                 },
                 Return => {
-                    let new_pre_facts = context.clone();
+                    let new_pre_facts = cx_paths.clone();
                     let change = mir_facts.remove(&pre_idx).map(|pre_facts|
                         pre_facts != new_pre_facts
                     ).unwrap_or(true);
@@ -587,11 +726,11 @@ pub trait BackwardsAnalysis {
                             let post_idx = StatementIdx(*succ_bb_idx, 0);
                             post_facts.push(mir_facts.get(&post_idx).unwrap());
                         }
-                        Self::join_many(post_facts)
+                        Self::Facts::join_many(post_facts)
                     };
                     let mir_info = state.info.get_mir_info(&mir_id);
                     evaluated_expression(other).map(|expr| {
-                        new_pre_facts = Self::join(&new_pre_facts, &Self::generate(mir_info, expr))
+                        new_pre_facts = new_pre_facts.join(&Self::generate(mir_info, expr))
                     });
                     let change = mir_facts.remove(&pre_idx).map(|pre_facts|
                         pre_facts != new_pre_facts
@@ -600,11 +739,12 @@ pub trait BackwardsAnalysis {
                     mir_facts.insert(pre_idx, new_pre_facts);
                 }
             }
-            println!("    New Flow: {:?}", new_flow);
+            //println!("    New Flow at Merge: {:?}", new_flow);
             if new_flow {
                 for (s_idx, statement) in basic_block.statements.iter().enumerate().rev() {
                     let post_idx = StatementIdx(bb_idx, s_idx + 1);
                     let pre_idx = StatementIdx(bb_idx, s_idx);
+                    //println!("    Statement Idx: {:?}", pre_idx);
                     if !Self::apply_transfer(mir_id, &state.info, &mut mir_facts,
                                              pre_idx, post_idx, &statement.kind) {
                         new_flow = false;
@@ -612,6 +752,7 @@ pub trait BackwardsAnalysis {
                     }
                 }
             }
+            //println!("    New Flow at Start: {:?}", new_flow);
             if new_flow {
                 mir.predecessors_for(bb_idx).iter().map(|pred_idx|
                     bb_queue.push_back(*pred_idx)
@@ -622,11 +763,24 @@ pub trait BackwardsAnalysis {
 
         if mir_facts.get(&START_STMT) != start_facts.as_ref() {
             // If our start facts changed, we've got to work on the dependencies
-            state.queue.enqueue_dependents(&au);
+            state.queue.enqueue_dependents(&true_au);
         }
-        println!("Putting back ctx {:?}", au);
+
+        // If we just did an analysis in the user context, then we potentially modify the user
+        // context
+        if let (fn_nid, Context::User) = true_au {
+            let mut global = Self::extract_global_facts(mir_facts.get(&START_STMT).unwrap(), mir_info);
+            global = global.join(&state.user_cx);
+            if global != state.user_cx {
+                state.queue.enqueue_user_cxs();
+                //println!("  New User Cx: {:?}", global);
+                //println!("         From: {:?}", state.user_cx);
+                state.user_cx = global;
+            }
+        }
+        println!("Putting back ctx {:?}", true_au);
         //print_map_lines(&mir_facts);
-        state.context_and_fn_to_fact_map.insert(au, mir_facts);
+        state.context_and_fn_to_fact_map.insert(true_au, mir_facts);
     }
 
     fn fn_call_transfer<'mir,'tcx>(mir_id: NodeId,
@@ -636,7 +790,7 @@ pub trait BackwardsAnalysis {
                                    fn_op: &Operand<'tcx>,
                                    arg_ops: &Vec<Operand<'tcx>>,
                                    dest: &Lvalue<'tcx>)
-                                   -> (Option<AnalysisUnit<Self::Facts>>, Self::Facts);
+                                   -> (Option<RawAnalysisUnit<Self::Facts>>, Self::Facts);
 
     /// Apply the transfer function across this statment, which must lie between the two indices.
     /// Returns whether or not the facts for `pre_idx` actually changed because of the transfer
@@ -665,6 +819,11 @@ pub trait BackwardsAnalysis {
         mir_facts.insert(pre_idx, new_pre_facts);
         change
     }
+
+    fn extract_global_facts<'a, 'mir, 'gcx: 'tcx, 'tcx: 'mir + 'a>(
+        entry_facts: &Self::Facts,
+        mir_info: MIRInfo<'a, 'mir, 'tcx, 'gcx>
+    ) -> Self::GlobalFacts;
 }
 
 

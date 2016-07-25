@@ -112,10 +112,10 @@ impl<'a> AnalyzeUnsafe<'a> {
             let hir = state.hir_crate.unwrap();
             let tcx = state.tcx.expect("Type context should exist");
             let mir_map = state.mir_map.expect("We should be in orbit - use `-Z orbit`");
-            let escape_analysis = ComplexEscapeAnalysis::flow(mir_map, tcx);
+            let escape_analysis = ComplexEscapeAnalysis::flow(mir_map, tcx, analysis.access_levels.clone());
             for (au, map) in escape_analysis.context_and_fn_to_fact_map.iter() {
-                errln!("{:?} ", au);
-                print_map_lines(map);
+                //errln!("{:?} ", au);
+                //print_map_lines(map);
             }
             escape_analysis.get_lints(analysis, hir).iter().map(|&(span, ref err)|
                 state.session.span_warn(span, err)
