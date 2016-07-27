@@ -1,3 +1,4 @@
+#![feature(rustc_attrs)]
 pub struct MyBox {
     x: i32,
     pub p: *const i32,
@@ -13,11 +14,10 @@ impl MyBox {
         b
     }
     pub fn get(&self) -> i32 {
+        //~^ WARN critical argument `((*self).0#1)`
         unsafe { *self.p }
     }
 }
 
-fn main() {
-    let b = MyBox::new(5);
-    b.get();
-}
+#[rustc_error]
+fn main() {} //~ ERROR compilation successful

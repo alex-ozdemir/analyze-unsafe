@@ -31,6 +31,15 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::iter::{self,IntoIterator};
 
+use std::io::Write;
+macro_rules! errln(
+    ($($arg:tt)*) => { {
+        let r = writeln!(&mut ::std::io::stderr(), $($arg)*);
+        r.expect("failed printing to stderr");
+    } }
+);
+
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 // A unique index for each statement in a MIR. First, the basic block, then the position of the
 // statment in the basic block. Often this is used to refer to positions between statements, in
@@ -285,7 +294,7 @@ pub trait BackwardsAnalysis {
         let WorkItem(mir_id, context, flow_source) = work_item;
         let full_cx = (mir_id, context.clone());
         let mir = state.info.mir_map.map.get(&mir_id).unwrap();
-        println!("Pulling full ctx {:?}", full_cx);
+        errln!("Pulling full ctx {:?}", full_cx);
         let mut mir_facts = state.context_and_fn_to_fact_map.remove(&full_cx)
             .unwrap_or(HashMap::new());
 
@@ -293,7 +302,7 @@ pub trait BackwardsAnalysis {
         let mut bb_queue: VecDeque<BasicBlock> = VecDeque::new();
         match flow_source {
             FlowSource::Returns => {
-                println!("  BB Queue Initialized with all returns");
+                errln!("  BB Queue Initialized with all returns");
                 for (bb_idx, bb_data) in traversal::postorder(&mir) {
                     use rustc::mir::repr::TerminatorKind::*;
                     //TODO: do Resume / Unreachable matter at all?
@@ -305,13 +314,13 @@ pub trait BackwardsAnalysis {
             },
             FlowSource::Blocks(blocks) => bb_queue.extend(blocks),
         }
-        println!("  Initial BB Queue: {:?}", bb_queue);
+        errln!("  Initial BB Queue: {:?}", bb_queue);
 
         // Save start facts for comparison, so we know whether to update dependencies
         let start_facts = mir_facts.get(&START_STMT).map(|facts| facts.clone());
 
         while let Some(bb_idx) = bb_queue.pop_front() {
-            println!("  Visiting BB {:?}", bb_idx);
+            errln!("  Visiting BB {:?}", bb_idx);
             let ref basic_block = mir[bb_idx];
             let mut new_flow = true;
 
@@ -337,7 +346,7 @@ pub trait BackwardsAnalysis {
                                                mir_facts.get(&post_idx).unwrap_or(&empty_set),
                                                func, args, lval);
                     if let Some(dep) = maybe_dependency {
-                        println!("    Dependency on {:?}, from {:?}", dep, bb_idx);
+                        errln!("    Dependency on {:?}, from {:?}", dep, bb_idx);
                         // We don't want to register dependencies on ourselves.
                         if dep != full_cx {
                             state.queue.register_dependency(&full_cx, dep, bb_idx);
@@ -383,7 +392,7 @@ pub trait BackwardsAnalysis {
                     mir_facts.insert(pre_idx, new_pre_facts);
                 }
             }
-            println!("    New Flow: {:?}", new_flow);
+            errln!("    New Flow: {:?}", new_flow);
             if new_flow {
                 for (s_idx, statement) in basic_block.statements.iter().enumerate().rev() {
                     let post_idx = StatementIdx(bb_idx, s_idx + 1);
@@ -400,14 +409,14 @@ pub trait BackwardsAnalysis {
                     bb_queue.push_back(*pred_idx)
                 ).count();
             }
-            println!("  BB Queue: {:?}", bb_queue);
+            errln!("  BB Queue: {:?}", bb_queue);
         }
 
         if mir_facts.get(&START_STMT) != start_facts.as_ref() {
             // If our start facts changed, we've got to work on the dependencies
             state.queue.enqueue_dependents(&full_cx);
         }
-        println!("Putting back ctx {:?}", full_cx);
+        errln!("Putting back ctx {:?}", full_cx);
         //print_map_lines(&mir_facts);
         state.context_and_fn_to_fact_map.insert(full_cx, mir_facts);
     }
@@ -430,11 +439,11 @@ pub trait BackwardsAnalysis {
         let old_facts = mir_facts.remove(&pre_idx);
         let change = old_facts.as_ref().map_or(true, |facts| *facts != new_pre_facts);
         //if change {
-            //println!("Meaningful transfer from {:?} -> {:?}:", pre_idx, post_idx);
-            //println!("  Statement: {:?}", statement);
-            //println!("  Old (Pre): {:?}", old_facts);
-            //println!("  New (Pre): {:?}", new_pre_facts);
-            //println!("  Post     : {:?}", mir_facts.get(&post_idx).unwrap());
+            //errln!("Meaningful transfer from {:?} -> {:?}:", pre_idx, post_idx);
+            //errln!("  Statement: {:?}", statement);
+            //errln!("  Old (Pre): {:?}", old_facts);
+            //errln!("  New (Pre): {:?}", new_pre_facts);
+            //errln!("  Post     : {:?}", mir_facts.get(&post_idx).unwrap());
         //}
         mir_facts.insert(pre_idx, new_pre_facts);
         change
@@ -467,8 +476,8 @@ impl<'v> intravisit::Visitor<'v> for UnsafeIdLister {
 
 #[allow(dead_code)]
 fn print_map_lines<K: Debug + Eq + Hash, V: Debug>(map: &HashMap<K, V>) {
-    println!("Map:");
+    errln!("Map:");
     for (key, val) in map.iter() {
-        println!("  {:?} : {:?}", key, val);
+        errln!("  {:?} : {:?}", key, val);
     }
 }

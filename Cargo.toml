@@ -10,6 +10,9 @@ rustc-serialize = "0"
 libc = "0"
 lazy_static = "0.1.*"
 
+[dev-dependencies]
+compiletest_rs = "*"
+
 [[bin]]
 name = "analyze"
 path = "src/main.rs"

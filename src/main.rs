@@ -185,9 +185,9 @@ impl<'a,'callback: 'a> CompilerCalls<'a> for AnalyzeUnsafe<'callback> {
 
 #[allow(dead_code)]
 fn print_map_lines<K: Debug + Eq + Ord, V: Debug>(map: &BTreeMap<K, V>) {
-    println!("Map:");
+    errln!("Map:");
     for (key, val) in map.iter() {
-        println!("  {:?} : {:?}", key, val);
+        errln!("  {:?} : {:?}", key, val);
     }
 }
 

@@ -233,7 +233,6 @@ impl BackwardsAnalysis for ComplexEscapeAnalysis {
         for (path, criticalness) in entry_facts.iter() {
             if path.may_escape() {
                 if let Some(field_path) = mir_info.path_from_private(path.as_ref()) {
-                    println!("    Private path {:?} in {:?}", field_path, path);
                     paths.insert(field_path, criticalness.clone());
                 }
             }
@@ -281,9 +280,15 @@ impl<'mir,'tcx> AnalysisState<'mir,'tcx,CriticalPaths<BaseVar>,CriticalPaths<Def
                     .get(&(*fn_nid, Context::User))
                     .unwrap().get(&START_STMT).unwrap();
                 let concerning_paths: Vec<_> = start_facts.iter().filter_map(|(path, u)| {
-                    if path.of_argument() &&
-                       mir_info.is_path_exported(path.as_ref()) {
-                        Some(format!("{:?}", path))
+                    if path.of_argument() && mir_info.is_path_exported(path.as_ref()) {
+                        let path_string = format!("{:?}", path);
+                        Some(
+                            mir_info.get_ast_name(path.base()).map(|name| {
+                                let ugly_name = format!("{:?}", path.base());
+                                let pretty_name = format!("{}", name);
+                                path_string.replace(&ugly_name, &pretty_name)
+                            }).unwrap_or(path_string)
+                        )
                     } else { None }
                 }).collect();
                 if concerning_paths.len() == 0 {
