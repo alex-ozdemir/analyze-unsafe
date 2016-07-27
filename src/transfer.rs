@@ -516,7 +516,10 @@ pub fn flow<'a, 'mir, 'gcx, 'tcx>(info: MIRInfo<'a, 'mir, 'gcx, 'tcx>,
                 .collect::<Vec<_>>()
                 .iter()
             ),
+        // TODO: Need a strategy for closures.
+        &Aggregate(Closure(_, _), ref ops) if ops.len() == 0 => CriticalPaths::empty(),
         &Aggregate(Closure(_, _), _) => unimplemented!(),
+        // &Aggregate(Closure(_, _), _) => CriticalPaths::empty(),
         &InlineAsm { .. } => unimplemented!(),
     }
 }

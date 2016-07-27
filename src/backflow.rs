@@ -167,6 +167,7 @@ impl<'a, 'mir, 'gcx, 'tcx> MIRInfo<'a, 'mir, 'gcx, 'tcx> {
                     }
                 }
             }
+            ty = Self::narrow_to_single_ty(ty);
         }
         //errln!("      Path {:?} has type {:?}", p1, ty);
         ty
