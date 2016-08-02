@@ -7,7 +7,8 @@ extern crate syntax;
 #[macro_use] extern crate rustc;
 extern crate rustc_driver;
 extern crate rustc_errors;
-extern crate rustc_serialize;
+extern crate syntax_pos;
+extern crate serialize;
 extern crate rustc_data_structures;
 
 mod dataflow;
@@ -29,7 +30,7 @@ use complex::ComplexEscapeAnalysis;
 
 use backflow::BackwardsAnalysis;
 
-use rustc_serialize::json;
+use serialize::json;
 
 use rustc::hir;
 use rustc::hir::intravisit;
@@ -114,8 +115,8 @@ impl<'a> AnalyzeUnsafe<'a> {
             let mir_map = state.mir_map.expect("We should be in orbit - use `-Z orbit`");
             let escape_analysis = ComplexEscapeAnalysis::flow(mir_map, tcx, analysis.access_levels.clone());
             for (au, map) in escape_analysis.context_and_fn_to_fact_map.iter() {
-                //errln!("{:?} ", au);
-                //print_map_lines(map);
+                errln!("{:?} ", au);
+                print_map_lines(map);
             }
             escape_analysis.get_lints(analysis, hir).iter().map(|&(span, ref err)|
                 state.session.span_warn(span, err)

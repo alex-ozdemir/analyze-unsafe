@@ -6,6 +6,8 @@
 // This flow tool is for the complex data flow.
 
 use rustc::hir::{self, intravisit};
+use rustc::traits;
+use syntax_pos::{BytePos, NO_EXPANSION};
 use rustc::hir::def_id::DefId;
 use rustc::mir::repr::{BasicBlock,
                        Constant,
@@ -20,6 +22,8 @@ use rustc::mir::repr::{BasicBlock,
                        Var,
                        Arg,
 };
+
+use serialize::json;
 
 use base_var::BaseVar;
 
@@ -42,7 +46,7 @@ use std::iter::{self,IntoIterator};
 
 use path::{Path,PathRef};
 
-use std::io::Write;
+use std::io::{self,Write};
 macro_rules! errln(
     ($($arg:tt)*) => { {
         let r = writeln!(&mut ::std::io::stderr(), $($arg)*);
@@ -559,14 +563,84 @@ impl<'mir,'tcx> CrateInfo<'mir,'tcx> {
         }
     }
 
+    // Taken from solson's MIRI:
+    // https://github.com/solson/miri/blob/master/src/interpreter/terminator.rs
+    //
+    fn fulfill_obligation(&self, trait_ref: ty::PolyTraitRef<'tcx>) -> traits::Vtable<'tcx, ()> {
+        // Do the initial selection for the obligation. This yields the shallow result we are
+        // looking for -- that is, what specific impl.
+        let dummy_sp = Span { lo: BytePos(0), hi: BytePos(0), expn_id: NO_EXPANSION };
+        self.tcx.normalizing_infer_ctxt(traits::ProjectionMode::Any).enter(|infcx| {
+            let mut selcx = traits::SelectionContext::new(&infcx);
+
+            let obligation = traits::Obligation::new(
+                traits::ObligationCause::misc(dummy_sp, ast::DUMMY_NODE_ID),
+                trait_ref.to_poly_trait_predicate(),
+            );
+            let selection = selcx.select(&obligation).unwrap().unwrap();
+
+            // Currently, we use a fulfillment context to completely resolve all nested
+            // obligations.  This is because they can inform the inference of the impl's type
+            // parameters.
+            let mut fulfill_cx = traits::FulfillmentContext::new();
+            let vtable = selection.map(|predicate| {
+                fulfill_cx.register_predicate_obligation(&infcx, predicate);
+            });
+            infcx.drain_fulfillment_cx_or_panic(dummy_sp, &mut fulfill_cx, &vtable)
+        })
+    }
+
     // If there is MIR for the value of this operand, this functions finds its ID (assuming the
     // operand is just constant).
-    pub fn get_fn_node_id(&self, func_op: &Operand<'tcx>) -> Option<NodeId> {
-        self.get_fn_def_id(func_op).and_then(|def_id| self.tcx.map.as_local_node_id(def_id)
-            .and_then(|node_id|
-                if self.mir_map.map.contains_key(&node_id) { Some(node_id) }
-                else { None }
-                ))
+    //
+    // Also took a lot of code from solson/miri
+    pub fn get_fn_node_id(&self,
+                          caller_node_id: &NodeId,
+                          func_op: &Operand<'tcx>) -> Option<NodeId> {
+        // We start by looking up the type of the function_operand being called.
+        let caller_mir = self.node_id_to_mir(caller_node_id).expect("Callee MIR Node ID is bad");
+        let op_ty = caller_mir.operand_ty(self.tcx, func_op);
+        let (resolved_def_id, resolved_substs) = match op_ty.sty {
+            // If this is a function pointer we can't figure out which MIR it refers to.
+            ty::TyFnPtr(_) => return None,
+            ty::TyFnDef(def_id, substs, fn_ty) => {
+                if substs.self_ty().is_some() {
+                    let method_item = self.tcx.impl_or_trait_item(def_id);
+                    let trait_def_id = method_item.container().id();
+                    let trait_ref = substs.to_trait_ref(self.tcx, trait_def_id);
+                    match self.fulfill_obligation(ty::Binder(trait_ref)) {
+                        traits::VtableImpl(vtable_impl_data) => {
+                            let impl_def_id = vtable_impl_data.impl_def_id;
+                            let impl_substs = vtable_impl_data.substs.with_method_from(substs);
+                            let substs = self.tcx.mk_substs(impl_substs);
+                            let method_name = self.tcx.item_name(def_id);
+                            get_impl_method_def_id_and_substs(self.tcx, impl_def_id,
+                                                              substs, method_name)
+                        }
+                        traits::VtableClosure(vtable_closure_data) => {
+                            (vtable_closure_data.closure_def_id,
+                             vtable_closure_data.substs.func_substs)
+                        }
+                        // TODO: Perhaps we can handle default impl's too?
+                        // traits::VtableDefaultImpl
+                        _ => unimplemented!(),
+                    }
+                }
+                else {
+                    (def_id, substs)
+                }
+            }
+            _ => panic!("Not a function type!\n{:#?}\n{:#?}", func_op, op_ty.sty),
+        };
+        //errln!("    Type: {:?}", fn_ty);
+        //self.get_fn_def_id(func_op).and_then(|def_id| {
+        errln!("    Resolved Def {:?}", resolved_def_id);
+        self.tcx.map.as_local_node_id(resolved_def_id)
+        .and_then(|node_id| {
+            errln!("    Node {:?}", node_id);
+            if self.mir_map.map.contains_key(&node_id) { Some(node_id) }
+            else { None }
+        })
     }
 
     pub fn node_id_to_mir(&self, node_id: &NodeId) -> Option<&'mir Mir<'tcx>> {
@@ -694,6 +768,10 @@ pub trait BackwardsAnalysis {
                 },
                 // TODO handle non-static calls
                 Call { destination: Some((ref lval, next_bb)), ref func, ref args, .. } => {
+                    errln!("    Function: {:?}", func);
+//                    if let &Operand::Constant(ref c) = func {
+//                        write!(io::stderr(), "{}", json::as_json(&c.literal));
+//                    }
                     let post_idx = StatementIdx(next_bb, 0);
                     let empty = Self::Facts::default();
                     let (maybe_dependency, new_pre_facts) =
@@ -866,5 +944,38 @@ fn print_map_lines<K: Debug + Eq + Hash, V: Debug>(map: &HashMap<K, V>) {
     errln!("Map:");
     for (key, val) in map.iter() {
         errln!("  {:?} : {:?}", key, val);
+    }
+}
+
+// Taken from solson/miri
+/// Locates the applicable def_id and substs of a method, given its name and the impl def_id.
+fn get_impl_method_def_id_and_substs<'a, 'tcx>(
+    tcx: TyCtxt<'a, 'tcx, 'tcx>,
+    impl_def_id: DefId,
+    substs: &'tcx ty::subst::Substs<'tcx>,
+    name: ast::Name,
+) -> (DefId, &'tcx ty::subst::Substs<'tcx>) {
+    use rustc::ty::TypeFoldable;
+    assert!(!substs.types.needs_infer());
+
+    let trait_def_id = tcx.trait_id_of_impl(impl_def_id).unwrap();
+    let trait_def = tcx.lookup_trait_def(trait_def_id);
+
+    match trait_def.ancestors(impl_def_id).fn_defs(tcx, name).next() {
+        Some(node_item) => {
+            let substs = tcx.normalizing_infer_ctxt(traits::ProjectionMode::Any).enter(|infcx| {
+                let substs = traits::translate_substs(&infcx, impl_def_id,
+                                                      substs, node_item.node);
+                tcx.lift(&substs).unwrap_or_else(|| {
+                    bug!("trans::meth::get_impl_method: translate_substs \
+                          returned {:?} which contains inference types/regions",
+                         substs);
+                })
+            });
+            (node_item.item.def_id, substs)
+        }
+        None => {
+            bug!("method {:?} not found in {:?}", name, impl_def_id)
+        }
     }
 }

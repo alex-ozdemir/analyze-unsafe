@@ -120,7 +120,7 @@ impl BackwardsAnalysis for ComplexEscapeAnalysis {
                                    dest: &Lvalue<'tcx>)
                                    -> (Option<RawAnalysisUnit<Self::Facts>>, Self::Facts) {
 
-        let fn_id = crate_info.get_fn_node_id(fn_op);
+        let fn_id = crate_info.get_fn_node_id(&mir_id, fn_op);
         let mut mir_info = crate_info.get_mir_info(&mir_id);
 
         let mut new_pre_facts = CriticalPaths::empty();
@@ -146,14 +146,14 @@ impl BackwardsAnalysis for ComplexEscapeAnalysis {
 
         // CriticalPaths uninvolved with the return flow around the fn-call.
         new_pre_facts.extend(dont_involve_ret.into_iter());
-
+        errln!("  Fn: {:?}", fn_id);
         match fn_id {
             None => {
                 let def_id = crate_info.get_fn_def_id(fn_op);
                 let mir = crate_info.get_mir(&mir_id);
                 let is_unsafe = match def_id {
                     Some(def_id) => {
-                        if crate_info.get_fn_node_id(fn_op).is_none() {
+                        if crate_info.get_fn_node_id(&mir_id, fn_op).is_none() {
                             match crate_info.tcx.lookup_item_type(def_id).ty.sty {
                                 TypeVariants::TyFnDef(_, _, ref bare_fn_ty) |
                                 TypeVariants::TyFnPtr(ref bare_fn_ty) =>
