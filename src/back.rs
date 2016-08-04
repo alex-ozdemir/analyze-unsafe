@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 // Alex Ozdemir <aozdemir@hmc.edu>
 //
 // A backwards data-flow analysis for determining when functions are dereferencing unverified types

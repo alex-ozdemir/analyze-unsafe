@@ -23,8 +23,6 @@ use rustc::mir::repr::{BasicBlock,
                        Arg,
 };
 
-use serialize::json;
-
 use base_var::BaseVar;
 
 use rustc_data_structures::indexed_vec::Idx;
@@ -32,21 +30,21 @@ use rustc_data_structures::indexed_vec::Idx;
 use rustc::mir::traversal;
 use rustc::mir::mir_map::MirMap;
 use rustc::middle::privacy::AccessLevels;
-use rustc::ty::{self,TyCtxt,TypeVariants,Ty,TypeAndMut};
+use rustc::ty::{self,BareFnTy,TyCtxt,TypeVariants,Ty};
 
 use dep_graph::KeyedDepGraph;
 
 use syntax::ast::{self,NodeId};
 use syntax::codemap::Span;
 
-use std::collections::{BTreeSet,BTreeMap,HashSet,HashMap,VecDeque};
+use std::collections::{BTreeMap,HashSet,HashMap,VecDeque};
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::iter::{self,IntoIterator};
 
 use path::{Path,PathRef};
 
-use std::io::{self,Write};
+use std::io::Write;
 macro_rules! errln(
     ($($arg:tt)*) => { {
         let r = writeln!(&mut ::std::io::stderr(), $($arg)*);
@@ -163,6 +161,8 @@ impl<'a, 'mir, 'gcx, 'tcx> MIRInfo<'a, 'mir, 'gcx, 'tcx> {
                         TyStruct(ref adt_def, ref substs) |
                         TyEnum(ref adt_def, ref substs) =>
                             adt_def.variants[variant_idx].fields[field_idx].ty(self.tcx, substs),
+                        TyClosure(_, ref closure_substs) =>
+                            closure_substs.upvar_tys[field_idx],
                         _ => bug!("Path {:?} specifies field ({},{}) of type {:?}",
                                   p1,
                                   variant_idx,
@@ -306,7 +306,6 @@ impl<'a, 'mir, 'gcx, 'tcx> MIRInfo<'a, 'mir, 'gcx, 'tcx> {
     /// Thus, when considering a path `*p` on a `p` with type [*const T], we need to skip over the
     /// [] and deref the *const T to get T.
     fn narrow_to_single_ty(mut ty: Ty<'tcx>) -> Ty<'tcx> {
-        use rustc::ty::TypeVariants::*;
         while let Some(inner_ty) = ty.builtin_index() {
             ty = inner_ty;
         }
@@ -343,7 +342,7 @@ impl<'a, 'mir, 'gcx, 'tcx> MIRInfo<'a, 'mir, 'gcx, 'tcx> {
             BaseVar::Var(ref var) => Some(self.mir.var_decls[*var].name),
             BaseVar::Temp(_) => None,
             BaseVar::Arg(ref arg) => Some(self.mir.arg_decls[*arg].debug_name),
-            BaseVar::Static(def_id) => None,
+            BaseVar::Static(_) => None,
             BaseVar::ReturnPointer => None,
         }
     }
@@ -360,6 +359,13 @@ pub struct CrateInfo<'mir,'tcx:'mir> {
     // The Type Context, also includes the map from DefId's to NodeId's
     pub tcx: ty::TyCtxt<'mir,'tcx,'tcx>,
 }
+
+#[derive(Debug)]
+pub struct FnInfo<'tcx> {
+    pub node_id: NodeId,
+    pub ty: &'tcx BareFnTy<'tcx>,
+}
+
 
 impl<'mir, 'tcx> CrateInfo<'mir, 'tcx> {
     pub fn get_mir_info<'a>(&'a self, mir_id: &NodeId) -> MIRInfo<'a, 'mir, 'tcx, 'tcx> {
@@ -590,17 +596,29 @@ impl<'mir,'tcx> CrateInfo<'mir,'tcx> {
         })
     }
 
+    pub fn get_fn_ty(&self,
+                     caller_node_id: &NodeId,
+                     func_op: &Operand<'tcx>) -> &'tcx ty::BareFnTy<'tcx> {
+        let caller_mir = self.node_id_to_mir(caller_node_id).expect("Callee MIR Node ID is bad");
+        let op_ty = caller_mir.operand_ty(self.tcx, func_op);
+        match op_ty.sty {
+            TypeVariants::TyFnDef(_, _, bare_fn_ty) => bare_fn_ty,
+            TypeVariants::TyFnPtr(bare_fn_ty) => bare_fn_ty,
+            _ => bug!("Should be a function type!"),
+        }
+    }
+
     // If there is MIR for the value of this operand, this functions finds its ID (assuming the
-    // operand is just constant).
+    // operand is just constant) and precise type.
     //
     // Also took a lot of code from solson/miri
-    pub fn get_fn_node_id(&self,
-                          caller_node_id: &NodeId,
-                          func_op: &Operand<'tcx>) -> Option<NodeId> {
+    pub fn get_fn_info(&self,
+                       caller_node_id: &NodeId,
+                       func_op: &Operand<'tcx>) -> Option<FnInfo<'tcx>> {
         // We start by looking up the type of the function_operand being called.
         let caller_mir = self.node_id_to_mir(caller_node_id).expect("Callee MIR Node ID is bad");
         let op_ty = caller_mir.operand_ty(self.tcx, func_op);
-        let (resolved_def_id, resolved_substs) = match op_ty.sty {
+        let (resolved_def_id, _, fn_ty) = match op_ty.sty {
             // If this is a function pointer we can't figure out which MIR it refers to.
             ty::TyFnPtr(_) => return None,
             ty::TyFnDef(def_id, substs, fn_ty) => {
@@ -608,7 +626,7 @@ impl<'mir,'tcx> CrateInfo<'mir,'tcx> {
                     let method_item = self.tcx.impl_or_trait_item(def_id);
                     let trait_def_id = method_item.container().id();
                     let trait_ref = substs.to_trait_ref(self.tcx, trait_def_id);
-                    match self.fulfill_obligation(ty::Binder(trait_ref)) {
+                    let (id, substs) = match self.fulfill_obligation(ty::Binder(trait_ref)) {
                         traits::VtableImpl(vtable_impl_data) => {
                             let impl_def_id = vtable_impl_data.impl_def_id;
                             let impl_substs = vtable_impl_data.substs.with_method_from(substs);
@@ -623,14 +641,15 @@ impl<'mir,'tcx> CrateInfo<'mir,'tcx> {
                         }
                         // TODO: Perhaps we can handle default impl's too?
                         // traits::VtableDefaultImpl
-                        _ => unimplemented!(),
-                    }
+                        other_table => bug!("Unimplemented VTable option: {:#?}\nTy: {:#?}", other_table, op_ty.sty),
+                    };
+                    (id, substs, fn_ty)
                 }
                 else {
-                    (def_id, substs)
+                    (def_id, substs, fn_ty)
                 }
             }
-            _ => panic!("Not a function type!\n{:#?}\n{:#?}", func_op, op_ty.sty),
+            _ => bug!("Not a function type!\n{:#?}\n{:#?}", func_op, op_ty.sty),
         };
         //errln!("    Type: {:?}", fn_ty);
         //self.get_fn_def_id(func_op).and_then(|def_id| {
@@ -638,7 +657,9 @@ impl<'mir,'tcx> CrateInfo<'mir,'tcx> {
         self.tcx.map.as_local_node_id(resolved_def_id)
         .and_then(|node_id| {
             errln!("    Node {:?}", node_id);
-            if self.mir_map.map.contains_key(&node_id) { Some(node_id) }
+            if self.mir_map.map.contains_key(&node_id) {
+                Some(FnInfo{ node_id: node_id, ty: fn_ty })
+            }
             else { None }
         })
     }
@@ -857,7 +878,7 @@ pub trait BackwardsAnalysis {
 
         // If we just did an analysis in the user context, then we potentially modify the user
         // context
-        if let (fn_nid, Context::User) = true_au {
+        if true_au.1 == Context::User {
             let mut global = Self::extract_global_facts(mir_facts.get(&START_STMT).unwrap(), mir_info);
             global = global.join(&state.user_cx);
             if global != state.user_cx {

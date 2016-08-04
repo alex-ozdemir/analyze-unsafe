@@ -6,12 +6,10 @@ fn main() {} //~ ERROR compilation successful
 
 pub fn flow_through_closure(p: *const i32) -> i32 {
     //~^ WARN critical argument `p`
-    let id = |p: *const i32| p;
-    let q2 = id(p);
-    let q = id_fn(q2);
+    let q = id_fn(p);
     unsafe { *q }
 }
 
-pub fn id_fn(p: *const i32) -> *const i32 {
-    p
+pub fn id_fn<T>(x: T) -> T {
+    x
 }

@@ -5,6 +5,7 @@ use backflow::{AnalysisUnit,
                Expr,
                Context,
                Facts,
+               FnInfo,
                get_unsafe_fn_ids,
                MIRInfo,
                START_STMT,
@@ -18,17 +19,17 @@ use rustc::mir::repr::{Lvalue,
                        Arg,
 };
 
+use rustc_data_structures::indexed_vec::Idx;
 use rustc::hir::def_id::DefId;
 
 use rustc::hir;
-use rustc::ty::{self, TypeVariants};
+use rustc::ty;
 
-use path::{Path,paths_to_field_acc};
+use path::{Path,paths_to_field_acc,Projectable};
 
 use transfer::{transfer,
                join,
                operand_path,
-               lvalue_path,
                gen_by_lvalue,
                gen_by_rvalue,
                gen_by_operand,
@@ -36,17 +37,16 @@ use transfer::{transfer,
                CriticalUse,
 };
 
-use base_var::BaseVar;
+use base_var::{BaseVar,lvalue_to_var};
 
 use syntax::ast::NodeId;
 use syntax::codemap::Span;
+use syntax::abi;
 
 use backflow::{
     AnalysisState,
     RawAnalysisUnit,
 };
-
-use std::collections::{BTreeSet,HashSet};
 
 use std::fmt::Debug;
 
@@ -120,7 +120,7 @@ impl BackwardsAnalysis for ComplexEscapeAnalysis {
                                    dest: &Lvalue<'tcx>)
                                    -> (Option<RawAnalysisUnit<Self::Facts>>, Self::Facts) {
 
-        let fn_id = crate_info.get_fn_node_id(&mir_id, fn_op);
+        let fn_info = crate_info.get_fn_info(&mir_id, fn_op);
         let mut mir_info = crate_info.get_mir_info(&mir_id);
 
         let mut new_pre_facts = CriticalPaths::empty();
@@ -134,7 +134,7 @@ impl BackwardsAnalysis for ComplexEscapeAnalysis {
         let assign_from_ret = StatementKind::Assign(dest.clone(),ret_rvalue.clone());
 
         let callee_info = crate_info.get_mir_info(&mir_id);
-        let (mut facts_at_end_of_callee, dont_involve_ret): (Self::Facts,_) =
+        let (facts_at_end_of_callee, dont_involve_ret): (Self::Facts,_) =
             Self::transfer(callee_info, post_facts, &assign_from_ret).into_iter()
                 .partition(|&(ref p,_)| p.has_base(&fresh_base_var));
 
@@ -146,29 +146,10 @@ impl BackwardsAnalysis for ComplexEscapeAnalysis {
 
         // CriticalPaths uninvolved with the return flow around the fn-call.
         new_pre_facts.extend(dont_involve_ret.into_iter());
-        errln!("  Fn: {:?}", fn_id);
-        match fn_id {
+        errln!("  Fn: {:?}", fn_info);
+        match fn_info {
             None => {
-                let def_id = crate_info.get_fn_def_id(fn_op);
-                let mir = crate_info.get_mir(&mir_id);
-                let is_unsafe = match def_id {
-                    Some(def_id) => {
-                        if crate_info.get_fn_node_id(&mir_id, fn_op).is_none() {
-                            match crate_info.tcx.lookup_item_type(def_id).ty.sty {
-                                TypeVariants::TyFnDef(_, _, ref bare_fn_ty) |
-                                TypeVariants::TyFnPtr(ref bare_fn_ty) =>
-                                    bare_fn_ty.unsafety == hir::Unsafety::Unsafe,
-                                _ => bug!("Should be a function type!"),
-                            }
-                        } else {
-                            false
-                        }
-                    },
-                    // None means it's a closure, treat it as unsafe.
-                    // TODO: I think this is the only sound option, but it is quite imprecise
-                    None => true,
-                };
-                let l_path = lvalue_path(dest);
+                let is_unsafe = crate_info.get_fn_ty(&mir_id, fn_op).unsafety == hir::Unsafety::Unsafe;
                 let critical_return = facts_at_end_of_callee.len() > 0;
 
                 // Generate any facts from evaluating actual arguments
@@ -184,18 +165,44 @@ impl BackwardsAnalysis for ComplexEscapeAnalysis {
                 }
                 (None, new_pre_facts)
             },
-            Some(id) => {
+            Some(FnInfo{ node_id: id, ty: fn_ty}) => {
                 // Determine the analysis unit for the callee.
                 let raw_context = facts_at_end_of_callee.into_iter().collect();
                 let callee_analysis_unit = (id, raw_context);
 
                 // Lookup the facts for the AU's formal arguments.
-                let args_and_paths =
+                let mut args_and_paths =
                     get_arg_paths(&callee_analysis_unit, crate_info, context_and_fn_to_fact_map);
 
                 // Assign the actual arguments to the formal ones.
-                args_and_paths.into_iter().zip(arg_ops).map(|((arg_id,paths),arg_ops)| {
-                    let arg_rval = Rvalue::Use(arg_ops.clone());
+                match fn_ty.abi {
+                    abi::Abi::Rust => {
+                        // Arguments / Paths already in the correct format.
+                    },
+                    abi::Abi::RustCall => {
+                        // In the RustCall Abi the first actual argument is the receiver and the
+                        // second is a tuple of arguments. However, for the formal parameters the
+                        // first argument is the reciever and the 2nd through nth are the rest of
+                        // the arguments (the tuple is split).
+                        debug_assert_eq!(2, arg_ops.len());
+                        let mut args_and_paths_i = args_and_paths.into_iter();
+                        let receiver_arg_and_paths = args_and_paths_i.next()
+                                                                     .expect("Must be a 1st arg");
+                        // Replace the rest of the paths with extensions of the tuple
+                        let tuple_arg = Lvalue::Arg(Arg::new(1));
+                        let mut tuple_paths = CriticalPaths::empty();
+                        args_and_paths_i.enumerate().map(|(i, (arg_id, mut paths))| {
+                            let tuple_field =
+                                Path::from_base(BaseVar::Arg(Arg::new(1))).tuple_field(i);
+                            paths.replace_base(&lvalue_to_var(&arg_id), tuple_field);
+                            tuple_paths.extend(paths);
+                        }).count();
+                        args_and_paths = vec![receiver_arg_and_paths, (tuple_arg, tuple_paths)];
+                    },
+                    _ => bug!("How do we even have a MIR if it's not rust?!"),
+                }
+                args_and_paths.into_iter().zip(arg_ops).map(|((_,paths),arg_op)| {
+                    let arg_rval = Rvalue::Use(arg_op.clone());
                     let tmp_arg_id = mir_info.fresh_var();
                     let tmp_arg_base_var = BaseVar::Var(tmp_arg_id);
                     let tmp_arg_lval = Lvalue::Var(tmp_arg_id);
@@ -212,7 +219,6 @@ impl BackwardsAnalysis for ComplexEscapeAnalysis {
                     );
                     new_pre_facts.extend(re_interned_paths)
                 }).count();
-
 
                 // Verify that the fn_op didn't produce any facts, nor did the ret_ptr
                 debug_assert_eq!(0, Self::generate(mir_info, Expr::Operand(fn_op)).len());
@@ -254,7 +260,7 @@ fn get_arg_paths<'mir,'tcx>(raw_au: &RawAnalysisUnit<CriticalPaths<BaseVar>>,
     arg_decls.indices().map(|arg_id| {
         let arg = BaseVar::Arg(arg_id);
         let arg_facts = start_facts.iter()
-            .filter(|&(path, u)| path.has_base(&arg))
+            .filter(|&(path, _)| path.has_base(&arg))
             .map(|(path,u)| (path.clone(), u.clone())).collect();
         (Lvalue::Arg(arg_id), arg_facts)
 
@@ -279,12 +285,13 @@ impl<'mir,'tcx> AnalysisState<'mir,'tcx,CriticalPaths<BaseVar>,CriticalPaths<Def
                 let start_facts: &CriticalPaths<BaseVar> = self.context_and_fn_to_fact_map
                     .get(&(*fn_nid, Context::User))
                     .unwrap().get(&START_STMT).unwrap();
-                let concerning_paths: Vec<_> = start_facts.iter().filter_map(|(path, u)| {
+                let concerning_paths: Vec<_> = start_facts.iter().filter_map(|(path, _)| {
                     if path.of_argument() && mir_info.is_path_exported(path.as_ref()) {
                         let path_string = format!("{:?}", path);
                         Some(
                             mir_info.get_ast_name(path.base()).map(|name| {
                                 let ugly_name = format!("{:?}", path.base());
+                                // TODO: report criticalness
                                 let pretty_name = format!("{}", name);
                                 path_string.replace(&ugly_name, &pretty_name)
                             }).unwrap_or(path_string)

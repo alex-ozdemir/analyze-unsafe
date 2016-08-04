@@ -1,6 +1,5 @@
 #![allow(dead_code,unused_imports)]
 use base_var::BaseVar;
-use transfer::CriticalPaths;
 
 use rustc::mir::repr::{CastKind,
                        Constant,
@@ -207,6 +206,13 @@ impl<Base: Clone + Eq> Path<Base> {
 
     pub fn change_base(&mut self, base: Base) {
         self.base = base;
+    }
+
+    pub fn replace_base(&mut self, base: &Base, path: Path<Base>) {
+        if self.base == *base {
+            let old_self = mem::replace(self, path);
+            self.extend_in_place(old_self.as_extension());
+        }
     }
 
     pub fn as_extension(&self) -> &[Projection] {

@@ -18,9 +18,7 @@ use rustc_data_structures::indexed_vec::Idx;
 
 use rustc::ty;
 
-use rustc::mir::repr::{Constant,
-                       Literal,
-                       Lvalue,
+use rustc::mir::repr::{Lvalue,
                        Mir,
                        Operand,
                        StatementKind,
@@ -197,6 +195,7 @@ impl BackwardsAnalysis for SimpleEscapeAnalysis {
 }
 
 impl<'mir,'tcx> AnalysisState<'mir,'tcx,BaseVar> {
+    #[allow(dead_code)]
     pub fn get_lints(&self,
                      analysis: &ty::CrateAnalysis,
                      hir: &hir::Crate)

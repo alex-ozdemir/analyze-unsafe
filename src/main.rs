@@ -24,13 +24,9 @@ mod transfer;
 
 use count::UnsafeData;
 
-use simple::SimpleEscapeAnalysis;
-
 use complex::ComplexEscapeAnalysis;
 
 use backflow::BackwardsAnalysis;
-
-use serialize::json;
 
 use rustc::hir;
 use rustc::hir::intravisit;
@@ -40,11 +36,8 @@ use rustc::session::{config,Session};
 use rustc_driver::{driver,CompilerCalls,RustcDefaultCalls,Compilation};
 use rustc_driver::driver::CompileState;
 
-use syntax::diagnostics;
-
 use std::collections::BTreeMap;
 use std::fmt::Debug;
-use std::hash::Hash;
 use std::mem;
 use std::path::PathBuf;
 

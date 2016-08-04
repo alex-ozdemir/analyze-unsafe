@@ -124,7 +124,7 @@ impl<'v, 'a, 'tcx, 'b> intravisit::Visitor<'v> for UnsafeCounter<'a,'tcx,'b> {
                 fd: &'v hir::FnDecl,
                 b: &'v hir::Block,
                 s: Span,
-                _: ast::NodeId) {
+                id: ast::NodeId) {
         match fk {
             intravisit::FnKind::ItemFn(_, _, unsafety, _, _, _, _) => {
                 if let hir::Unsafety::Unsafe = unsafety {
@@ -143,7 +143,7 @@ impl<'v, 'a, 'tcx, 'b> intravisit::Visitor<'v> for UnsafeCounter<'a,'tcx,'b> {
                 // TODO(aozdemir): There is some interesting work to do here.
             }
         }
-        intravisit::walk_fn(self, fk, fd, b, s)
+        intravisit::walk_fn(self, fk, fd, b, s, id)
     }
 }
 

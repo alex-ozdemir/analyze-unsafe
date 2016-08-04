@@ -1,6 +1,6 @@
-use path::{Path,PathRef,Projection,TmpPath,TmpProjection,Projectable};
+use path::{Path,Projection,TmpPath,TmpProjection,Projectable};
 use base_var::BaseVar;
-use backflow::{CrateInfo,MIRInfo};
+use backflow::MIRInfo;
 
 use std::iter::{FromIterator,IntoIterator};
 
@@ -8,16 +8,12 @@ use rustc::mir::repr::{
     CastKind,
     Lvalue,
     LvalueProjection,
-    Mir,
     Operand,
     ProjectionElem,
-    Statement,
     StatementKind,
     Rvalue,
-    Var,
 };
 
-use rustc::ty::{TypeVariants,TyCtxt};
 use rustc_data_structures::indexed_vec::Idx;
 
 use std::mem;
@@ -83,6 +79,12 @@ impl<Base: Clone + Ord> CriticalPaths<Base> {
     }
     pub fn len(&self) -> usize {
         self.map.len()
+    }
+    pub fn replace_base(&mut self, b: &Base, new: Path<Base>) {
+        mem::replace(self, Self::empty()).into_iter().map(|(mut path, u)| {
+            path.replace_base(b, new.clone());
+            self.insert(path, u);
+        }).count();
     }
 }
 
@@ -496,7 +498,8 @@ pub fn flow<'a, 'mir, 'gcx, 'tcx>(info: MIRInfo<'a, 'mir, 'gcx, 'tcx>,
                 .collect::<Vec<_>>()
                 .iter()
             ),
-        &Aggregate(Tuple, ref operands) =>
+        &Aggregate(Tuple, ref operands) |
+        &Aggregate(Closure(_, _), ref operands) =>
             join_many(
                 operands.iter().enumerate()
                 .map(|(field_idx, op)| {
@@ -517,8 +520,8 @@ pub fn flow<'a, 'mir, 'gcx, 'tcx>(info: MIRInfo<'a, 'mir, 'gcx, 'tcx>,
                 .iter()
             ),
         // TODO: Need a strategy for closures.
-        &Aggregate(Closure(_, _), ref ops) if ops.len() == 0 => CriticalPaths::empty(),
-        &Aggregate(Closure(_, _), _) => unimplemented!(),
+        // &Aggregate(Closure(_, _), ref ops) if ops.len() == 0 => CriticalPaths::empty(),
+        // &Aggregate(Closure(_, _), _) => unimplemented!(),
         // &Aggregate(Closure(_, _), _) => CriticalPaths::empty(),
         &InlineAsm { .. } => unimplemented!(),
     }
