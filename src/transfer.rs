@@ -5,7 +5,6 @@ use backflow::MIRInfo;
 use std::iter::{FromIterator,IntoIterator};
 
 use rustc::mir::repr::{
-    CastKind,
     Lvalue,
     LvalueProjection,
     Operand,
@@ -162,26 +161,6 @@ pub fn operand_path(operand: &Operand) -> Option<Path<BaseVar>> {
         Consume(ref lvalue) => Some(lvalue_path(lvalue)),
         // TODO: We know constants are safe, right?
         Constant(_) => None
-    }
-}
-
-/// The path for an rvalue. If the rvalue is a constant then no path is returned.
-pub fn rvalue_path(rvalue: &Rvalue) -> Option<Path<BaseVar>> {
-    use rustc::mir::repr::Rvalue::*;
-    match *rvalue {
-        Use(ref operand) | Repeat(ref operand, _) | Cast(CastKind::Misc, ref operand, _) |
-            Cast(_, ref operand, _) =>
-            operand_path(operand),
-        Ref(_, _, _) => bug!("Don't call rvalue_path on a Ref operation!"),
-        Aggregate(_, ref ops) => {
-            if ops.iter().all(|op| operand_path(op).is_none()) { None }
-            else { unimplemented!() }
-        },
-        UnaryOp(_, _) | BinaryOp(_, _, _) | CheckedBinaryOp(_, _, _) | Box(_) | Len(_) => None,
-
-        InlineAsm { .. } => {
-            unimplemented!();
-        },
     }
 }
 
@@ -419,7 +398,7 @@ pub fn flow_assign_lval_op_lval<'a, 'mir, 'gcx, 'tcx>(info: MIRInfo<'a, 'mir, 'g
     });
 
     let l2_is_crit = deref_post_facts.iter().any(|&(p,_)| {
-        p.sub_paths().into_iter().any(|(sub_p,_)| info.may_alias(sub_p, p1.as_ref()))
+        p.as_ref().sub_paths().into_iter().any(|(sub_p,_)| info.may_alias(sub_p, p1.as_ref()))
     }) || value_post_facts.iter().any(|&(p,_)| val_sub(info, p.clone(), p1, &p2).len() > 0);
 
     let mut pre_facts = CriticalPaths::empty();

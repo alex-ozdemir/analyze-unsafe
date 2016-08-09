@@ -5,7 +5,6 @@ use backflow::{AnalysisUnit,
                Expr,
                Context,
                Facts,
-               FnInfo,
                get_unsafe_fn_ids,
                MIRInfo,
                START_STMT,
@@ -66,6 +65,126 @@ impl<Base: Clone + Ord + Debug> Facts for CriticalPaths<Base> {
     }
 }
 
+impl ComplexEscapeAnalysis {
+    fn fn_call_mir_ids<'mir,'tcx>(
+        caller_mir_id: NodeId,
+        callee_mir_id: Option<NodeId>,
+        fn_ty: &'tcx ty::BareFnTy<'tcx>,
+        crate_info: &CrateInfo<'mir,'tcx>,
+        context_and_fn_to_fact_map: &CrateFactsMap<CriticalPaths<BaseVar>>,
+        post_facts: &CriticalPaths<BaseVar>,
+        arg_ops: &Vec<Operand<'tcx>>,
+        dest: &Lvalue<'tcx>)
+        -> (Option<RawAnalysisUnit<CriticalPaths<BaseVar>>>, CriticalPaths<BaseVar>)
+    {
+        let mut caller_info = crate_info.get_mir_info(&caller_mir_id);
+
+        let mut new_pre_facts = CriticalPaths::empty();
+
+        // Do `dest = ret`, where `ret` stands in for the return of the callee.
+        // Split the resulting facts by whether they involve the return.
+        // We use an intermediate
+        let fresh_var: Var  = caller_info.fresh_var();
+        let fresh_base_var = BaseVar::Var(fresh_var.clone());
+        let ret_rvalue = Rvalue::Use(Operand::Consume(Lvalue::Var(fresh_var)));
+        let assign_from_ret = StatementKind::Assign(dest.clone(),ret_rvalue.clone());
+
+        let (facts_at_end_of_callee, dont_involve_ret): (CriticalPaths<BaseVar>,_) =
+            Self::transfer(caller_info, post_facts, &assign_from_ret).into_iter()
+                .partition(|&(ref p,_)| p.has_base(&fresh_base_var));
+
+        let facts_at_end_of_callee: CriticalPaths<BaseVar> =
+            facts_at_end_of_callee.into_iter().map(|(mut p, u)| {
+                p.change_base(BaseVar::ReturnPointer);
+                (p, u)
+            }).collect();
+
+        // CriticalPaths uninvolved with the return flow around the fn-call.
+        new_pre_facts.extend(dont_involve_ret.into_iter());
+        errln!("  Fn: {:?}", callee_mir_id);
+        match callee_mir_id {
+            None => {
+                let is_unsafe = fn_ty.unsafety == hir::Unsafety::Unsafe;
+                let critical_return = facts_at_end_of_callee.len() > 0;
+
+                // Generate any facts from evaluating actual arguments
+                for op in arg_ops {
+                    new_pre_facts.extend(Self::generate(caller_info, Expr::Operand(op)))
+                }
+
+                // If unsafe or critical return, declare the all actual arguments value-critical
+                if is_unsafe || critical_return {
+                    new_pre_facts.extend(arg_ops.iter().filter_map(|op| {
+                        operand_path(op).map(|p| (p, CriticalUse::Value))
+                    }))
+                }
+                (None, new_pre_facts)
+            },
+            Some(id) => {
+                // Determine the analysis unit for the callee.
+                let raw_context = facts_at_end_of_callee.into_iter().collect();
+                let callee_analysis_unit = (id, raw_context);
+
+                // Lookup the facts for the AU's formal arguments.
+                let mut args_and_paths =
+                    get_arg_paths(&callee_analysis_unit, crate_info, context_and_fn_to_fact_map);
+
+                // Assign the actual arguments to the formal ones.
+                match fn_ty.abi {
+                    abi::Abi::Rust => {
+                        // Arguments / Paths already in the correct format.
+                    },
+                    abi::Abi::RustCall => {
+                        // In the RustCall Abi the first actual argument is the receiver and the
+                        // second is a tuple of arguments. However, for the formal parameters the
+                        // first argument is the reciever and the 2nd through nth are the rest of
+                        // the arguments (the tuple is split).
+                        debug_assert_eq!(2, arg_ops.len());
+                        let mut args_and_paths_i = args_and_paths.into_iter();
+                        let receiver_arg_and_paths = args_and_paths_i.next()
+                                                                     .expect("Must be a 1st arg");
+                        // Replace the rest of the paths with extensions of the tuple
+                        let tuple_arg = Lvalue::Arg(Arg::new(1));
+                        let mut tuple_paths = CriticalPaths::empty();
+                        args_and_paths_i.enumerate().map(|(i, (arg_id, mut paths))| {
+                            let tuple_field =
+                                Path::from_base(BaseVar::Arg(Arg::new(1))).tuple_field(i);
+                            paths.replace_base(&lvalue_to_var(&arg_id), tuple_field);
+                            tuple_paths.extend(paths);
+                        }).count();
+                        args_and_paths = vec![receiver_arg_and_paths, (tuple_arg, tuple_paths)];
+                    },
+                    _ => bug!("How do we even have a MIR if it's not rust?!"),
+                }
+                args_and_paths.into_iter().zip(arg_ops).map(|((_,paths),arg_op)| {
+                    let arg_rval = Rvalue::Use(arg_op.clone());
+                    let tmp_arg_id = caller_info.fresh_var();
+                    let tmp_arg_base_var = BaseVar::Var(tmp_arg_id);
+                    let tmp_arg_lval = Lvalue::Var(tmp_arg_id);
+                    let externed_paths = paths.into_iter().map(|(mut p, u)| {
+                        p.change_base(tmp_arg_base_var);
+                        (p, u)
+                    }).collect();
+                    let assignment = StatementKind::Assign(tmp_arg_lval,arg_rval);
+                    caller_info.set_optimistic_alias(true);
+                    let transferred_paths = Self::transfer(caller_info, &externed_paths, &assignment);
+                    caller_info.set_optimistic_alias(false);
+                    let re_interned_paths = transferred_paths.into_iter().filter(|&(ref p, _)|
+                        !p.has_base(&tmp_arg_base_var)
+                    );
+                    new_pre_facts.extend(re_interned_paths)
+                }).count();
+
+                // Verify that the fn_op didn't produce any facts, nor did the ret_ptr
+                debug_assert_eq!(0, Self::generate(caller_info, Expr::Rvalue(&ret_rvalue)).len());
+
+                (Some(callee_analysis_unit), new_pre_facts)
+            }
+        }
+    }
+
+}
+
 impl BackwardsAnalysis for ComplexEscapeAnalysis {
     type Facts = CriticalPaths<BaseVar>;
     type GlobalFacts = CriticalPaths<DefId>;
@@ -110,8 +229,7 @@ impl BackwardsAnalysis for ComplexEscapeAnalysis {
         }
     }
 
-
-    fn fn_call_transfer<'mir,'tcx>(mir_id: NodeId,
+    fn fn_call_transfer<'mir,'tcx>(caller_mir_id: NodeId,
                                    crate_info: &CrateInfo<'mir,'tcx>,
                                    context_and_fn_to_fact_map: &CrateFactsMap<Self::Facts>,
                                    post_facts: &Self::Facts,
@@ -120,115 +238,9 @@ impl BackwardsAnalysis for ComplexEscapeAnalysis {
                                    dest: &Lvalue<'tcx>)
                                    -> (Option<RawAnalysisUnit<Self::Facts>>, Self::Facts) {
 
-        let fn_info = crate_info.get_fn_info(&mir_id, fn_op);
-        let mut mir_info = crate_info.get_mir_info(&mir_id);
-
-        let mut new_pre_facts = CriticalPaths::empty();
-
-        // Do `dest = ret`, where `ret` stands in for the return of the callee.
-        // Split the resulting facts by whether they involve the return.
-        // We use an intermediate
-        let fresh_var: Var  = mir_info.fresh_var();
-        let fresh_base_var = BaseVar::Var(fresh_var.clone());
-        let ret_rvalue = Rvalue::Use(Operand::Consume(Lvalue::Var(fresh_var)));
-        let assign_from_ret = StatementKind::Assign(dest.clone(),ret_rvalue.clone());
-
-        let callee_info = crate_info.get_mir_info(&mir_id);
-        let (facts_at_end_of_callee, dont_involve_ret): (Self::Facts,_) =
-            Self::transfer(callee_info, post_facts, &assign_from_ret).into_iter()
-                .partition(|&(ref p,_)| p.has_base(&fresh_base_var));
-
-        let facts_at_end_of_callee: CriticalPaths<BaseVar> =
-            facts_at_end_of_callee.into_iter().map(|(mut p, u)| {
-                p.change_base(BaseVar::ReturnPointer);
-                (p, u)
-            }).collect();
-
-        // CriticalPaths uninvolved with the return flow around the fn-call.
-        new_pre_facts.extend(dont_involve_ret.into_iter());
-        errln!("  Fn: {:?}", fn_info);
-        match fn_info {
-            None => {
-                let is_unsafe = crate_info.get_fn_ty(&mir_id, fn_op).unsafety == hir::Unsafety::Unsafe;
-                let critical_return = facts_at_end_of_callee.len() > 0;
-
-                // Generate any facts from evaluating actual arguments
-                for op in arg_ops {
-                    new_pre_facts.extend(Self::generate(mir_info, Expr::Operand(op)))
-                }
-
-                // If unsafe or critical return, declare the all actual arguments value-critical
-                if is_unsafe || critical_return {
-                    new_pre_facts.extend(arg_ops.iter().filter_map(|op| {
-                        operand_path(op).map(|p| (p, CriticalUse::Value))
-                    }))
-                }
-                (None, new_pre_facts)
-            },
-            Some(FnInfo{ node_id: id, ty: fn_ty}) => {
-                // Determine the analysis unit for the callee.
-                let raw_context = facts_at_end_of_callee.into_iter().collect();
-                let callee_analysis_unit = (id, raw_context);
-
-                // Lookup the facts for the AU's formal arguments.
-                let mut args_and_paths =
-                    get_arg_paths(&callee_analysis_unit, crate_info, context_and_fn_to_fact_map);
-
-                // Assign the actual arguments to the formal ones.
-                match fn_ty.abi {
-                    abi::Abi::Rust => {
-                        // Arguments / Paths already in the correct format.
-                    },
-                    abi::Abi::RustCall => {
-                        // In the RustCall Abi the first actual argument is the receiver and the
-                        // second is a tuple of arguments. However, for the formal parameters the
-                        // first argument is the reciever and the 2nd through nth are the rest of
-                        // the arguments (the tuple is split).
-                        debug_assert_eq!(2, arg_ops.len());
-                        let mut args_and_paths_i = args_and_paths.into_iter();
-                        let receiver_arg_and_paths = args_and_paths_i.next()
-                                                                     .expect("Must be a 1st arg");
-                        // Replace the rest of the paths with extensions of the tuple
-                        let tuple_arg = Lvalue::Arg(Arg::new(1));
-                        let mut tuple_paths = CriticalPaths::empty();
-                        args_and_paths_i.enumerate().map(|(i, (arg_id, mut paths))| {
-                            let tuple_field =
-                                Path::from_base(BaseVar::Arg(Arg::new(1))).tuple_field(i);
-                            paths.replace_base(&lvalue_to_var(&arg_id), tuple_field);
-                            tuple_paths.extend(paths);
-                        }).count();
-                        args_and_paths = vec![receiver_arg_and_paths, (tuple_arg, tuple_paths)];
-                    },
-                    _ => bug!("How do we even have a MIR if it's not rust?!"),
-                }
-                args_and_paths.into_iter().zip(arg_ops).map(|((_,paths),arg_op)| {
-                    let arg_rval = Rvalue::Use(arg_op.clone());
-                    let tmp_arg_id = mir_info.fresh_var();
-                    let tmp_arg_base_var = BaseVar::Var(tmp_arg_id);
-                    let tmp_arg_lval = Lvalue::Var(tmp_arg_id);
-                    let externed_paths = paths.into_iter().map(|(mut p, u)| {
-                        p.change_base(tmp_arg_base_var);
-                        (p, u)
-                    }).collect();
-                    let assignment = StatementKind::Assign(tmp_arg_lval,arg_rval);
-                    mir_info.set_optimistic_alias(true);
-                    let transferred_paths = Self::transfer(mir_info, &externed_paths, &assignment);
-                    mir_info.set_optimistic_alias(false);
-                    let re_interned_paths = transferred_paths.into_iter().filter(|&(ref p, _)|
-                        !p.has_base(&tmp_arg_base_var)
-                    );
-                    new_pre_facts.extend(re_interned_paths)
-                }).count();
-
-                // Verify that the fn_op didn't produce any facts, nor did the ret_ptr
-                debug_assert_eq!(0, Self::generate(mir_info, Expr::Operand(fn_op)).len());
-                debug_assert_eq!(0, Self::generate(mir_info, Expr::Rvalue(&ret_rvalue)).len());
-
-                (Some(callee_analysis_unit), new_pre_facts)
-            }
-        }
-        //TODO handle mysterious functions
-        // Generate ...
+        let callee_mir_id = crate_info.get_fn_mir_id(&caller_mir_id, fn_op);
+        let fn_ty = crate_info.get_fn_ty(&caller_mir_id, fn_op);
+        Self::fn_call_mir_ids(caller_mir_id, callee_mir_id, fn_ty, crate_info, context_and_fn_to_fact_map, post_facts, arg_ops, dest)
     }
 
     fn extract_global_facts<'a, 'mir, 'gcx: 'tcx, 'tcx: 'mir + 'a>(

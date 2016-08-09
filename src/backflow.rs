@@ -30,7 +30,7 @@ use rustc_data_structures::indexed_vec::Idx;
 use rustc::mir::traversal;
 use rustc::mir::mir_map::MirMap;
 use rustc::middle::privacy::AccessLevels;
-use rustc::ty::{self,BareFnTy,TyCtxt,TypeVariants,Ty};
+use rustc::ty::{self,TyCtxt,TypeVariants,Ty};
 
 use dep_graph::KeyedDepGraph;
 
@@ -129,9 +129,14 @@ impl<'a, 'mir, 'gcx, 'tcx> MIRInfo<'a, 'mir, 'gcx, 'tcx> {
         }
     }
 
-    // TODO!
+    // TODO: Fix this!
     pub fn may_reach<'b>(&self, p1: PathRef<'b, BaseVar>, p2: PathRef<'b, BaseVar>) -> bool {
-        p1 == p2
+        for (p2sub, _) in p2.sub_paths() {
+            if self.may_alias(p1.clone(), p2sub) {
+                return true;
+            }
+        }
+        return false;
     }
 
     pub fn path_ty(&self, p1: PathRef<BaseVar>) -> Ty<'tcx> {
@@ -348,6 +353,14 @@ impl<'a, 'mir, 'gcx, 'tcx> MIRInfo<'a, 'mir, 'gcx, 'tcx> {
     }
 }
 
+///// An option representing code that could be run at a dynamic dispatch site.
+//#[derive(PartialEq,Eq,Hash,Debug,Clone,Copy)]
+//pub enum DDOption {
+//    /// Code (A mir_id) that we have (an can analyze).
+//    Known(NodeId),
+//    /// Unknown code - something we can't analyze.
+//    Unknown,
+//}
 
 pub struct CrateInfo<'mir,'tcx:'mir> {
     // The MIRs for the crate
@@ -359,13 +372,6 @@ pub struct CrateInfo<'mir,'tcx:'mir> {
     // The Type Context, also includes the map from DefId's to NodeId's
     pub tcx: ty::TyCtxt<'mir,'tcx,'tcx>,
 }
-
-#[derive(Debug)]
-pub struct FnInfo<'tcx> {
-    pub node_id: NodeId,
-    pub ty: &'tcx BareFnTy<'tcx>,
-}
-
 
 impl<'mir, 'tcx> CrateInfo<'mir, 'tcx> {
     pub fn get_mir_info<'a>(&'a self, mir_id: &NodeId) -> MIRInfo<'a, 'mir, 'tcx, 'tcx> {
@@ -575,15 +581,18 @@ impl<'mir,'tcx> CrateInfo<'mir,'tcx> {
     fn fulfill_obligation(&self, trait_ref: ty::PolyTraitRef<'tcx>) -> traits::Vtable<'tcx, ()> {
         // Do the initial selection for the obligation. This yields the shallow result we are
         // looking for -- that is, what specific impl.
+        errln!("    Selection Begins: Trait Ref: {:?}", trait_ref);
         let dummy_sp = Span { lo: BytePos(0), hi: BytePos(0), expn_id: NO_EXPANSION };
-        self.tcx.normalizing_infer_ctxt(traits::ProjectionMode::Any).enter(|infcx| {
+        let res = self.tcx.normalizing_infer_ctxt(traits::ProjectionMode::Any).enter(|infcx| {
             let mut selcx = traits::SelectionContext::new(&infcx);
 
             let obligation = traits::Obligation::new(
                 traits::ObligationCause::misc(dummy_sp, ast::DUMMY_NODE_ID),
                 trait_ref.to_poly_trait_predicate(),
             );
-            let selection = selcx.select(&obligation).unwrap().unwrap();
+            let raw_selection = selcx.select(&obligation);
+            errln!("    Selection: {:?}", raw_selection);
+            let selection = raw_selection.unwrap().unwrap();
 
             // Currently, we use a fulfillment context to completely resolve all nested
             // obligations.  This is because they can inform the inference of the impl's type
@@ -593,7 +602,9 @@ impl<'mir,'tcx> CrateInfo<'mir,'tcx> {
                 fulfill_cx.register_predicate_obligation(&infcx, predicate);
             });
             infcx.drain_fulfillment_cx_or_panic(dummy_sp, &mut fulfill_cx, &vtable)
-        })
+        });
+        errln!("    Selection Result: {:?}", res);
+        res
     }
 
     pub fn get_fn_ty(&self,
@@ -612,21 +623,21 @@ impl<'mir,'tcx> CrateInfo<'mir,'tcx> {
     // operand is just constant) and precise type.
     //
     // Also took a lot of code from solson/miri
-    pub fn get_fn_info(&self,
-                       caller_node_id: &NodeId,
-                       func_op: &Operand<'tcx>) -> Option<FnInfo<'tcx>> {
+    pub fn get_fn_mir_id(&self,
+                         caller_node_id: &NodeId,
+                         func_op: &Operand<'tcx>) -> Option<NodeId> {
         // We start by looking up the type of the function_operand being called.
         let caller_mir = self.node_id_to_mir(caller_node_id).expect("Callee MIR Node ID is bad");
         let op_ty = caller_mir.operand_ty(self.tcx, func_op);
-        let (resolved_def_id, _, fn_ty) = match op_ty.sty {
+        let (resolved_def_id, _) = match op_ty.sty {
             // If this is a function pointer we can't figure out which MIR it refers to.
             ty::TyFnPtr(_) => return None,
-            ty::TyFnDef(def_id, substs, fn_ty) => {
+            ty::TyFnDef(def_id, substs, _) => {
                 if substs.self_ty().is_some() {
                     let method_item = self.tcx.impl_or_trait_item(def_id);
                     let trait_def_id = method_item.container().id();
                     let trait_ref = substs.to_trait_ref(self.tcx, trait_def_id);
-                    let (id, substs) = match self.fulfill_obligation(ty::Binder(trait_ref)) {
+                    match self.fulfill_obligation(ty::Binder(trait_ref)) {
                         traits::VtableImpl(vtable_impl_data) => {
                             let impl_def_id = vtable_impl_data.impl_def_id;
                             let impl_substs = vtable_impl_data.substs.with_method_from(substs);
@@ -639,14 +650,15 @@ impl<'mir,'tcx> CrateInfo<'mir,'tcx> {
                             (vtable_closure_data.closure_def_id,
                              vtable_closure_data.substs.func_substs)
                         }
+                        traits::VtableObject(_) |
+                        traits::VtableFnPointer(_) => return None,
                         // TODO: Perhaps we can handle default impl's too?
                         // traits::VtableDefaultImpl
                         other_table => bug!("Unimplemented VTable option: {:#?}\nTy: {:#?}", other_table, op_ty.sty),
-                    };
-                    (id, substs, fn_ty)
+                    }
                 }
                 else {
-                    (def_id, substs, fn_ty)
+                    (def_id, substs)
                 }
             }
             _ => bug!("Not a function type!\n{:#?}\n{:#?}", func_op, op_ty.sty),
@@ -658,7 +670,7 @@ impl<'mir,'tcx> CrateInfo<'mir,'tcx> {
         .and_then(|node_id| {
             errln!("    Node {:?}", node_id);
             if self.mir_map.map.contains_key(&node_id) {
-                Some(FnInfo{ node_id: node_id, ty: fn_ty })
+                Some(node_id)
             }
             else { None }
         })
@@ -758,7 +770,7 @@ pub trait BackwardsAnalysis {
                     use rustc::mir::repr::TerminatorKind::*;
                     //TODO: do Resume / Unreachable matter at all?
                     match bb_data.terminator().kind {
-                        Return => bb_queue.push_back(bb_idx),
+                        Return => bb_queue.push_front(bb_idx),
                         _ => (),
                     };
                 }

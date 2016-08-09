@@ -178,6 +178,23 @@ impl<'a, Base> PathRef<'a, Base> {
     pub fn has_indirection(&self) -> bool {
         self.projections.iter().any(|p| p == &Projection::Deref)
     }
+
+    pub fn sub_paths(&self) -> Vec<(PathRef<Base>,&[Projection])> {
+        (0..self.projections.len()).map(|i| self.split_at(i)).collect()
+    }
+
+    /// Split the Path into a PathRef and Extension at `idx`.
+    ///
+    /// ## Panics
+    ///
+    /// If `idx` is greater than or equal to the number of projections
+    fn split_at(&self, idx: usize) -> (PathRef<Base>, &[Projection]) {
+        let (head, tail) = self.projections.split_at(idx);
+        let path_ref = PathRef{ projections: head, base: self.base };
+        (path_ref, tail)
+    }
+
+
 }
 
 impl<Base: Clone> Path<Base> {
@@ -228,23 +245,8 @@ impl<Base: Clone + Eq> Path<Base> {
         self
     }
 
-    /// Split the Path into a PathRef and Extension at `idx`.
-    ///
-    /// ## Panics
-    ///
-    /// If `idx` is greater than or equal to the number of projections
-    fn split_at(&self, idx: usize) -> (PathRef<Base>, &[Projection]) {
-        let (head, tail) = self.projections.as_slice().split_at(idx);
-        let path_ref = PathRef{ projections: head, base: &self.base };
-        (path_ref, tail)
-    }
-
     pub fn extend_in_place(&mut self, extension: &[Projection]) {
         self.projections.extend_from_slice(extension);
-    }
-
-    pub fn sub_paths(&self) -> Vec<(PathRef<Base>,&[Projection])> {
-        (0..self.projections.len()).map(|i| self.split_at(i)).collect()
     }
 
     pub fn strip_highest_deref(mut self) -> Option<Path<Base>> {

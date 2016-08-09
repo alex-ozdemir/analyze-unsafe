@@ -19,13 +19,27 @@ use rustc::mir::repr::{Arg,
 use rustc::hir::def_id::DefId;
 use rustc::ty;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+use std::fmt;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum BaseVar {
     Var(Var),
     Temp(Temp),
     Arg(Arg),
     Static(DefId),
     ReturnPointer,
+}
+
+impl fmt::Debug for BaseVar {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            BaseVar::Var(v) => write!(f, "{:?}", v),
+            BaseVar::Temp(v) => write!(f, "{:?}", v),
+            BaseVar::Arg(v) => write!(f, "{:?}", v),
+            BaseVar::Static(v) => write!(f, "Static({:?})", v),
+            BaseVar::ReturnPointer => write!(f, "ret"),
+        }
+    }
 }
 
 pub fn lvalue_to_var(lvalue: &Lvalue) -> BaseVar {
