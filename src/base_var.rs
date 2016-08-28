@@ -264,8 +264,7 @@ pub fn lvalue_ptr_derefs<'tcx, 'mir, 'gcx>(mir: &Mir<'tcx>,
             let mut v = lvalue_ptr_derefs(mir, tcx, base);
             match elem {
                 &ProjectionElem::Deref => {
-                    let base_ty = mir.lvalue_ty(tcx, base);
-                    if let ty::TypeVariants::TyRawPtr(_) = base_ty.to_ty(tcx).sty {
+                    if let ty::TypeVariants::TyRawPtr(_) = base.ty(mir, tcx).to_ty(tcx).sty {
                         v.extend(lvalue_used_vars(base));
                     }
                 },

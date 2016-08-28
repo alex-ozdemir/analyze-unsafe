@@ -7,6 +7,7 @@
 
 use rustc::hir::{self, intravisit};
 use rustc::traits;
+use rustc::traits::Reveal;
 use syntax_pos::{BytePos, NO_EXPANSION};
 use rustc::hir::def_id::DefId;
 use rustc::mir::repr::{BasicBlock,
@@ -30,7 +31,7 @@ use rustc_data_structures::indexed_vec::Idx;
 use rustc::mir::traversal;
 use rustc::mir::mir_map::MirMap;
 use rustc::middle::privacy::AccessLevels;
-use rustc::ty::{self,TyCtxt,TypeVariants,Ty};
+use rustc::ty::{self,TyCtxt,TypeVariants,Ty,subst};
 
 use dep_graph::KeyedDepGraph;
 
@@ -72,10 +73,10 @@ pub type MIRFactsMap<Facts> = BTreeMap<StatementIdx,Facts>;
 pub type CrateFactsMap<Facts> = BTreeMap<AnalysisUnit<Facts>,MIRFactsMap<Facts>>;
 
 #[derive(Clone, Copy)]
-pub struct MIRInfo<'a, 'mir, 'gcx: 'tcx, 'tcx: 'mir + 'a>{
+pub struct MIRInfo<'a, 'mir: 'a, 'gcx: 'tcx, 'tcx: 'mir + 'a>{
     mir: &'a Mir<'tcx>,
     tcx: TyCtxt<'mir, 'gcx, 'tcx>,
-    access_levels: &'a AccessLevels,
+    analysis: &'a ty::CrateAnalysis<'mir>,
     /// This flag indicates whether MIRInfo should skip the sound alias analysis in favor of an
     /// optimistic one (all distinct paths not may alias).
     ///
@@ -91,7 +92,7 @@ pub struct MIRInfo<'a, 'mir, 'gcx: 'tcx, 'tcx: 'mir + 'a>{
 
 impl<'a, 'mir, 'gcx, 'tcx> MIRInfo<'a, 'mir, 'gcx, 'tcx> {
     pub fn lvalue_ty(&self, lvalue: &Lvalue<'tcx>) -> Ty<'tcx> {
-        &self.mir.lvalue_ty(self.tcx, lvalue).to_ty(self.tcx)
+        lvalue.ty(self.mir, self.tcx).to_ty(self.tcx)
     }
 
     pub fn is_raw_ptr(&self, lvalue: &Lvalue<'tcx>) -> bool {
@@ -201,7 +202,7 @@ impl<'a, 'mir, 'gcx, 'tcx> MIRInfo<'a, 'mir, 'gcx, 'tcx> {
                         TyEnum(ref adt_def, _) => {
                             let ref variant = adt_def.variants[variant_idx];
                             self.tcx.map.as_local_node_id(variant.did)
-                            .map(|node_id| !self.access_levels.is_reachable(node_id))
+                            .map(|node_id| !self.analysis.access_levels.is_reachable(node_id))
                             .unwrap_or(false)
                         },
                         _ => { bug!("Path {:?} _just_ downcasts the type {:?}, with variant {}",
@@ -218,7 +219,7 @@ impl<'a, 'mir, 'gcx, 'tcx> MIRInfo<'a, 'mir, 'gcx, 'tcx> {
                         TyEnum(ref adt_def, ref substs) => {
                             let ref variant = adt_def.variants[variant_idx];
                             let not_exported = self.tcx.map.as_local_node_id(variant.did)
-                                .map(|node_id| !self.access_levels.is_reachable(node_id))
+                                .map(|node_id| !self.analysis.access_levels.is_reachable(node_id))
                                 .unwrap_or(false);
                             if not_exported {
                                 bug!("Variant is not exported! {:?}, ty {:?}, var {:?}",
@@ -262,7 +263,7 @@ impl<'a, 'mir, 'gcx, 'tcx> MIRInfo<'a, 'mir, 'gcx, 'tcx> {
                         TyEnum(ref adt_def, _) => {
                             let ref variant = adt_def.variants[variant_idx];
                             self.tcx.map.as_local_node_id(variant.did)
-                            .map(|node_id| !self.access_levels.is_reachable(node_id))
+                            .map(|node_id| !self.analysis.access_levels.is_reachable(node_id))
                             .unwrap_or(false)
                         },
                         _ => { bug!("Path {:?} _just_ downcasts the type {:?}, with variant {}",
@@ -279,7 +280,7 @@ impl<'a, 'mir, 'gcx, 'tcx> MIRInfo<'a, 'mir, 'gcx, 'tcx> {
                         TyEnum(ref adt_def, ref substs) => {
                             let ref variant = adt_def.variants[variant_idx];
                             let not_exported = self.tcx.map.as_local_node_id(variant.did)
-                                .map(|node_id| !self.access_levels.is_reachable(node_id))
+                                .map(|node_id| !self.analysis.access_levels.is_reachable(node_id))
                                 .unwrap_or(false);
                             if not_exported {
                                 bug!("Variant is not exported! {:?}, ty {:?}, var {:?}",
@@ -367,30 +368,30 @@ pub struct CrateInfo<'mir,'tcx:'mir> {
     pub mir_map: &'mir MirMap<'tcx>,
 
     // The privacy status of items
-    pub access_levels: AccessLevels,
+    pub analysis: ty::CrateAnalysis<'mir>,
 
     // The Type Context, also includes the map from DefId's to NodeId's
     pub tcx: ty::TyCtxt<'mir,'tcx,'tcx>,
 }
 
 impl<'mir, 'tcx> CrateInfo<'mir, 'tcx> {
-    pub fn get_mir_info<'a>(&'a self, mir_id: &NodeId) -> MIRInfo<'a, 'mir, 'tcx, 'tcx> {
+    pub fn get_mir_info<'a>(&'a self, mir_id: &DefId) -> MIRInfo<'a, 'mir, 'tcx, 'tcx> {
         let mir = self.get_mir(mir_id);
-        let ref access_levels = self.access_levels;
+        let ref analysis = self.analysis;
         MIRInfo {
             mir: mir,
             tcx: self.tcx.clone(),
             optimistic_alias: false,
-            access_levels: access_levels,
+            analysis: analysis,
         }
     }
-    pub fn get_mir(&self, mir_id: &NodeId) -> &Mir<'tcx> {
+    pub fn get_mir(&self, mir_id: &DefId) -> &Mir<'tcx> {
         self.mir_map.map.get(mir_id).expect("CrateInfo created for an invalid MIRID")
     }
 }
 
-pub type AnalysisUnit<Facts> = (NodeId, Context<Facts>);
-pub type RawAnalysisUnit<Facts> = (NodeId, RawContext<Facts>);
+pub type AnalysisUnit<Facts> = (DefId, Context<Facts>);
+pub type RawAnalysisUnit<Facts> = (DefId, RawContext<Facts>);
 
 pub struct AnalysisState<'mir,'tcx:'mir,Facts,GlobalFacts> {
     // Holds the fact map for each MIR, in each context
@@ -425,13 +426,13 @@ pub struct WorkQueue<Facts> {
     entered: HashSet<AnalysisUnit<Facts>>,
 
     /// A list of the functions in the crate
-    functions: Vec<NodeId>,
+    functions: Vec<DefId>,
 }
 
 
 impl<Facts: Hash + Eq + Clone> WorkQueue<Facts> {
 
-    pub fn new<I: Iterator<Item=NodeId>>(functions: I) -> WorkQueue<Facts> {
+    pub fn new<I: Iterator<Item=DefId>>(functions: I) -> WorkQueue<Facts> {
         let mut q = WorkQueue {
             deps: KeyedDepGraph::new(),
             queue: VecDeque::new(),
@@ -504,8 +505,8 @@ impl<Facts: Hash + Eq + Clone> WorkQueue<Facts> {
         fns.iter().map(|other_id| self.enqueue_user_cx(other_id)).count();
     }
 
-    fn enqueue_user_cx(&mut self, fn_nid: &NodeId) {
-        let au = (*fn_nid, Context::User);
+    fn enqueue_user_cx(&mut self, fn_did: &DefId) {
+        let au = (*fn_did, Context::User);
         if !self.map.contains_key(&au) {
             self.map.insert(au.clone(), FlowSource::Returns);
             self.queue.push_back(au.clone());
@@ -526,7 +527,7 @@ impl<Facts: Hash + Eq + Clone> WorkQueue<Facts> {
 ///
 /// The NodeId indicate which MIR, the Context indicates which facts should hold at returns, and
 /// the FlowSource indicates where the flow should begin within the MIR.
-pub struct WorkItem<Facts>(NodeId, Context<Facts>, FlowSource);
+pub struct WorkItem<Facts>(DefId, Context<Facts>, FlowSource);
 
 /// Where flow should begin in an MIR.
 ///
@@ -542,12 +543,12 @@ impl<'mir,'tcx, Facts, GlobalFacts> AnalysisState<'mir,'tcx,Facts,GlobalFacts>
     fn new(
        mir_map: &'mir MirMap<'tcx>,
        tcx: ty::TyCtxt<'mir,'tcx,'tcx>,
-       access_levels: AccessLevels
+       analysis: ty::CrateAnalysis<'mir>
     ) -> AnalysisState<'mir,'tcx,Facts,GlobalFacts> {
         AnalysisState {
             context_and_fn_to_fact_map: BTreeMap::new(),
-            info: CrateInfo::new(mir_map, tcx, access_levels),
-            queue: WorkQueue::new(mir_map.map.keys().map(|id| *id)),
+            info: CrateInfo::new(mir_map, tcx, analysis),
+            queue: WorkQueue::new(mir_map.map.keys().iter().map(|id| *id)),
             user_cx: GlobalFacts::default(),
         }
     }
@@ -556,12 +557,12 @@ impl<'mir,'tcx, Facts, GlobalFacts> AnalysisState<'mir,'tcx,Facts,GlobalFacts>
 impl<'mir,'tcx> CrateInfo<'mir,'tcx> {
     fn new(mir_map: &'mir MirMap<'tcx>,
            tcx: ty::TyCtxt<'mir,'tcx,'tcx>,
-           access_levels: AccessLevels
+           analysis: ty::CrateAnalysis<'mir>
     ) -> CrateInfo<'mir,'tcx> {
         CrateInfo {
             mir_map: mir_map,
             tcx: tcx,
-            access_levels: access_levels
+            analysis: analysis
         }
     }
 
@@ -578,12 +579,13 @@ impl<'mir,'tcx> CrateInfo<'mir,'tcx> {
     // Taken from solson's MIRI:
     // https://github.com/solson/miri/blob/master/src/interpreter/terminator.rs
     //
-    fn fulfill_obligation(&self, trait_ref: ty::PolyTraitRef<'tcx>) -> traits::Vtable<'tcx, ()> {
+    fn fulfill_obligation(&self, trait_ref: ty::PolyTraitRef<'tcx>) -> Option<traits::Vtable<'tcx, ()>> {
         // Do the initial selection for the obligation. This yields the shallow result we are
         // looking for -- that is, what specific impl.
         errln!("    Selection Begins: Trait Ref: {:?}", trait_ref);
         let dummy_sp = Span { lo: BytePos(0), hi: BytePos(0), expn_id: NO_EXPANSION };
-        let res = self.tcx.normalizing_infer_ctxt(traits::ProjectionMode::Any).enter(|infcx| {
+        let mut normalizing_infer_ctxt = self.tcx.normalizing_infer_ctxt(Reveal::All);
+        let res = normalizing_infer_ctxt.enter(|infcx| {
             let mut selcx = traits::SelectionContext::new(&infcx);
 
             let obligation = traits::Obligation::new(
@@ -593,25 +595,30 @@ impl<'mir,'tcx> CrateInfo<'mir,'tcx> {
             let raw_selection = selcx.select(&obligation);
             errln!("    Selection: {:?}", raw_selection);
             let selection = raw_selection.unwrap().unwrap();
+            errln!("    Selection: {:#?}", selection);
+            self.tcx.lift_to_global(&selection.map(|_| ()))
 
-            // Currently, we use a fulfillment context to completely resolve all nested
-            // obligations.  This is because they can inform the inference of the impl's type
-            // parameters.
-            let mut fulfill_cx = traits::FulfillmentContext::new();
-            let vtable = selection.map(|predicate| {
-                fulfill_cx.register_predicate_obligation(&infcx, predicate);
-            });
-            infcx.drain_fulfillment_cx_or_panic(dummy_sp, &mut fulfill_cx, &vtable)
+            //// Currently, we use a fulfillment context to completely resolve all nested
+            //// obligations.  This is because they can inform the inference of the impl's type
+            //// parameters.
+            //let mut fulfill_cx = traits::FulfillmentContext::new();
+            //let vtable = selection.map(|predicate| {
+            //    fulfill_cx.register_predicate_obligation(&infcx, predicate);
+            //});
+            ////infcx.drain_fulfillment_cx_or_panic(dummy_sp, &mut fulfill_cx, &vtable)
+            //infcx.drain_fulfillment_cx(&mut fulfill_cx, &vtable).map(|vtable| {
+            //    self.tcx.lift_to_global(&vtable)
+            //})
         });
         errln!("    Selection Result: {:?}", res);
         res
     }
 
     pub fn get_fn_ty(&self,
-                     caller_node_id: &NodeId,
+                     caller_did: &DefId,
                      func_op: &Operand<'tcx>) -> &'tcx ty::BareFnTy<'tcx> {
-        let caller_mir = self.node_id_to_mir(caller_node_id).expect("Callee MIR Node ID is bad");
-        let op_ty = caller_mir.operand_ty(self.tcx, func_op);
+        let caller_mir = self.did_to_mir(caller_did).expect("Callee MIR Node ID is bad");
+        let op_ty = func_op.ty(caller_mir, self.tcx);
         match op_ty.sty {
             TypeVariants::TyFnDef(_, _, bare_fn_ty) => bare_fn_ty,
             TypeVariants::TyFnPtr(bare_fn_ty) => bare_fn_ty,
@@ -624,60 +631,61 @@ impl<'mir,'tcx> CrateInfo<'mir,'tcx> {
     //
     // Also took a lot of code from solson/miri
     pub fn get_fn_mir_id(&self,
-                         caller_node_id: &NodeId,
-                         func_op: &Operand<'tcx>) -> Option<NodeId> {
+                         caller_did: &DefId,
+                         func_op: &Operand<'tcx>) -> Option<DefId> {
         // We start by looking up the type of the function_operand being called.
-        let caller_mir = self.node_id_to_mir(caller_node_id).expect("Callee MIR Node ID is bad");
-        let op_ty = caller_mir.operand_ty(self.tcx, func_op);
-        let (resolved_def_id, _) = match op_ty.sty {
+        let caller_mir = self.did_to_mir(caller_did).expect("Callee MIR Node ID is bad");
+        let op_ty = func_op.ty(caller_mir, self.tcx);
+        let resolution = match op_ty.sty {
             // If this is a function pointer we can't figure out which MIR it refers to.
             ty::TyFnPtr(_) => return None,
             ty::TyFnDef(def_id, substs, _) => {
-                if substs.self_ty().is_some() {
+                if let Some(trait_def_id) = self.tcx.trait_of_item(def_id) {
                     let method_item = self.tcx.impl_or_trait_item(def_id);
-                    let trait_def_id = method_item.container().id();
-                    let trait_ref = substs.to_trait_ref(self.tcx, trait_def_id);
-                    match self.fulfill_obligation(ty::Binder(trait_ref)) {
-                        traits::VtableImpl(vtable_impl_data) => {
-                            let impl_def_id = vtable_impl_data.impl_def_id;
-                            let impl_substs = vtable_impl_data.substs.with_method_from(substs);
-                            let substs = self.tcx.mk_substs(impl_substs);
-                            let method_name = self.tcx.item_name(def_id);
-                            get_impl_method_def_id_and_substs(self.tcx, impl_def_id,
-                                                              substs, method_name)
+                    let trait_ref = ty::TraitRef::from_method(self.tcx, trait_def_id, substs);
+                    let trait_ref = self.tcx.normalize_associated_type(&ty::Binder(trait_ref));
+                    self.fulfill_obligation(trait_ref).and_then(|vtable| {
+                        match vtable {
+                            traits::VtableImpl(vtable_impl_data) => {
+                                let impl_def_id = vtable_impl_data.impl_def_id;
+                                let impl_substs = vtable_impl_data.substs;
+                                let method_name = self.tcx.item_name(def_id);
+                                Some(get_impl_method_def_id_and_substs(self.tcx, impl_def_id,
+                                                                       impl_substs, substs,
+                                                                       method_name))
+                            }
+                            traits::VtableClosure(vtable_closure_data) => {
+                                Some((vtable_closure_data.closure_def_id,
+                                     vtable_closure_data.substs.func_substs))
+                            }
+                            traits::VtableObject(_) |
+                            traits::VtableFnPointer(_) => None,
+                            // TODO: Perhaps we can handle default impl's too?
+                            // traits::VtableDefaultImpl
+                            other_table => bug!("Unimplemented VTable option: {:#?}\nTy: {:#?}", other_table, op_ty.sty),
                         }
-                        traits::VtableClosure(vtable_closure_data) => {
-                            (vtable_closure_data.closure_def_id,
-                             vtable_closure_data.substs.func_substs)
-                        }
-                        traits::VtableObject(_) |
-                        traits::VtableFnPointer(_) => return None,
-                        // TODO: Perhaps we can handle default impl's too?
-                        // traits::VtableDefaultImpl
-                        other_table => bug!("Unimplemented VTable option: {:#?}\nTy: {:#?}", other_table, op_ty.sty),
-                    }
+                    })
                 }
                 else {
-                    (def_id, substs)
+                    Some((def_id, substs))
                 }
             }
             _ => bug!("Not a function type!\n{:#?}\n{:#?}", func_op, op_ty.sty),
         };
-        //errln!("    Type: {:?}", fn_ty);
-        //self.get_fn_def_id(func_op).and_then(|def_id| {
-        errln!("    Resolved Def {:?}", resolved_def_id);
-        self.tcx.map.as_local_node_id(resolved_def_id)
-        .and_then(|node_id| {
-            errln!("    Node {:?}", node_id);
-            if self.mir_map.map.contains_key(&node_id) {
-                Some(node_id)
+        resolution.and_then(|(resolved_def_id, _)| {
+            //errln!("    Type: {:?}", fn_ty);
+            //self.get_fn_def_id(func_op).and_then(|def_id| {
+            // TODO: Do we need to verify it's in the mir_map?
+            errln!("    Resolved Def {:?}", resolved_def_id);
+            if self.mir_map.map.contains_key(&resolved_def_id) {
+                Some(resolved_def_id)
             }
             else { None }
         })
     }
 
-    pub fn node_id_to_mir(&self, node_id: &NodeId) -> Option<&'mir Mir<'tcx>> {
-        self.mir_map.map.get(node_id)
+    pub fn did_to_mir(&self, did: &DefId) -> Option<&'mir Mir<'tcx>> {
+        self.mir_map.map.get(did)
     }
 }
 
@@ -713,9 +721,9 @@ pub trait BackwardsAnalysis {
 
     fn flow<'mir,'tcx>(mir_map: &'mir MirMap<'tcx>,
                        tcx: ty::TyCtxt<'mir,'tcx,'tcx>,
-                       access_levels: AccessLevels)
+                       analysis: ty::CrateAnalysis<'mir>)
                        -> AnalysisState<'mir,'tcx,Self::Facts,Self::GlobalFacts> {
-        let mut state = AnalysisState::new(mir_map, tcx, access_levels);
+        let mut state = AnalysisState::new(mir_map, tcx, analysis);
         while let Some(work_item) = state.queue.get() {
             Self::flow_work_item(work_item, &mut state);
         }
@@ -905,7 +913,7 @@ pub trait BackwardsAnalysis {
         state.context_and_fn_to_fact_map.insert(true_au, mir_facts);
     }
 
-    fn fn_call_transfer<'mir,'tcx>(mir_id: NodeId,
+    fn fn_call_transfer<'mir,'tcx>(caller_did: DefId,
                                    crate_info: &CrateInfo<'mir,'tcx>,
                                    context_and_fn_to_fact_map: &CrateFactsMap<Self::Facts>,
                                    post_facts: &Self::Facts,
@@ -917,7 +925,7 @@ pub trait BackwardsAnalysis {
     /// Apply the transfer function across this statment, which must lie between the two indices.
     /// Returns whether or not the facts for `pre_idx` actually changed because of the transfer
     /// function, so that the caller can detect when the flow stabilizes.
-    fn apply_transfer<'mir,'gcx,'tcx>(mir_id: NodeId,
+    fn apply_transfer<'mir,'gcx,'tcx>(mir_did: DefId,
                                       crate_info: &CrateInfo<'mir,'tcx>,
                                       mir_facts: &mut MIRFactsMap<Self::Facts>,
                                       pre_idx: StatementIdx,
@@ -926,7 +934,7 @@ pub trait BackwardsAnalysis {
                                       -> bool {
         let new_pre_facts = {
             let post_facts = mir_facts.entry(post_idx).or_insert_with(Self::Facts::default);
-            let mir_info = crate_info.get_mir_info(&mir_id);
+            let mir_info = crate_info.get_mir_info(&mir_did);
             Self::transfer(mir_info, post_facts, statement)
         };
         let old_facts = mir_facts.remove(&pre_idx);
@@ -985,7 +993,8 @@ fn print_map_lines<K: Debug + Eq + Hash, V: Debug>(map: &HashMap<K, V>) {
 fn get_impl_method_def_id_and_substs<'a, 'tcx>(
     tcx: TyCtxt<'a, 'tcx, 'tcx>,
     impl_def_id: DefId,
-    substs: &'tcx ty::subst::Substs<'tcx>,
+    impl_substs: &'tcx subst::Substs<'tcx>,
+    substs: &'tcx subst::Substs<'tcx>,
     name: ast::Name,
 ) -> (DefId, &'tcx ty::subst::Substs<'tcx>) {
     use rustc::ty::TypeFoldable;
@@ -996,7 +1005,8 @@ fn get_impl_method_def_id_and_substs<'a, 'tcx>(
 
     match trait_def.ancestors(impl_def_id).fn_defs(tcx, name).next() {
         Some(node_item) => {
-            let substs = tcx.normalizing_infer_ctxt(traits::ProjectionMode::Any).enter(|infcx| {
+            let substs = tcx.normalizing_infer_ctxt(Reveal::All).enter(|infcx| {
+                let substs = substs.rebase_onto(tcx, trait_def_id, impl_substs);
                 let substs = traits::translate_substs(&infcx, impl_def_id,
                                                       substs, node_item.node);
                 tcx.lift(&substs).unwrap_or_else(|| {

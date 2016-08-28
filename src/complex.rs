@@ -20,6 +20,7 @@ use rustc::mir::repr::{Lvalue,
 
 use rustc_data_structures::indexed_vec::Idx;
 use rustc::hir::def_id::DefId;
+use rustc::hir::map as hir_map;
 
 use rustc::hir;
 use rustc::ty;
@@ -67,8 +68,8 @@ impl<Base: Clone + Ord + Debug> Facts for CriticalPaths<Base> {
 
 impl ComplexEscapeAnalysis {
     fn fn_call_mir_ids<'mir,'tcx>(
-        caller_mir_id: NodeId,
-        callee_mir_id: Option<NodeId>,
+        caller_did: DefId,
+        callee_did: Option<DefId>,
         fn_ty: &'tcx ty::BareFnTy<'tcx>,
         crate_info: &CrateInfo<'mir,'tcx>,
         context_and_fn_to_fact_map: &CrateFactsMap<CriticalPaths<BaseVar>>,
@@ -77,7 +78,7 @@ impl ComplexEscapeAnalysis {
         dest: &Lvalue<'tcx>)
         -> (Option<RawAnalysisUnit<CriticalPaths<BaseVar>>>, CriticalPaths<BaseVar>)
     {
-        let mut caller_info = crate_info.get_mir_info(&caller_mir_id);
+        let mut caller_info = crate_info.get_mir_info(&caller_did);
 
         let mut new_pre_facts = CriticalPaths::empty();
 
@@ -101,26 +102,9 @@ impl ComplexEscapeAnalysis {
 
         // CriticalPaths uninvolved with the return flow around the fn-call.
         new_pre_facts.extend(dont_involve_ret.into_iter());
-        errln!("  Fn: {:?}", callee_mir_id);
-        match callee_mir_id {
-            None => {
-                let is_unsafe = fn_ty.unsafety == hir::Unsafety::Unsafe;
-                let critical_return = facts_at_end_of_callee.len() > 0;
-
-                // Generate any facts from evaluating actual arguments
-                for op in arg_ops {
-                    new_pre_facts.extend(Self::generate(caller_info, Expr::Operand(op)))
-                }
-
-                // If unsafe or critical return, declare the all actual arguments value-critical
-                if is_unsafe || critical_return {
-                    new_pre_facts.extend(arg_ops.iter().filter_map(|op| {
-                        operand_path(op).map(|p| (p, CriticalUse::Value))
-                    }))
-                }
-                (None, new_pre_facts)
-            },
-            Some(id) => {
+        errln!("  Fn: {:?}", callee_did);
+        match callee_did {
+            Some(id) if id.is_local() => {
                 // Determine the analysis unit for the callee.
                 let raw_context = facts_at_end_of_callee.into_iter().collect();
                 let callee_analysis_unit = (id, raw_context);
@@ -180,6 +164,23 @@ impl ComplexEscapeAnalysis {
 
                 (Some(callee_analysis_unit), new_pre_facts)
             }
+            _ => {
+                let is_unsafe = fn_ty.unsafety == hir::Unsafety::Unsafe;
+                let critical_return = facts_at_end_of_callee.len() > 0;
+
+                // Generate any facts from evaluating actual arguments
+                for op in arg_ops {
+                    new_pre_facts.extend(Self::generate(caller_info, Expr::Operand(op)))
+                }
+
+                // If unsafe or critical return, declare the all actual arguments value-critical
+                if is_unsafe || critical_return {
+                    new_pre_facts.extend(arg_ops.iter().filter_map(|op| {
+                        operand_path(op).map(|p| (p, CriticalUse::Value))
+                    }))
+                }
+                (None, new_pre_facts)
+            },
         }
     }
 
@@ -229,7 +230,7 @@ impl BackwardsAnalysis for ComplexEscapeAnalysis {
         }
     }
 
-    fn fn_call_transfer<'mir,'tcx>(caller_mir_id: NodeId,
+    fn fn_call_transfer<'mir,'tcx>(caller_did: DefId,
                                    crate_info: &CrateInfo<'mir,'tcx>,
                                    context_and_fn_to_fact_map: &CrateFactsMap<Self::Facts>,
                                    post_facts: &Self::Facts,
@@ -238,9 +239,9 @@ impl BackwardsAnalysis for ComplexEscapeAnalysis {
                                    dest: &Lvalue<'tcx>)
                                    -> (Option<RawAnalysisUnit<Self::Facts>>, Self::Facts) {
 
-        let callee_mir_id = crate_info.get_fn_mir_id(&caller_mir_id, fn_op);
-        let fn_ty = crate_info.get_fn_ty(&caller_mir_id, fn_op);
-        Self::fn_call_mir_ids(caller_mir_id, callee_mir_id, fn_ty, crate_info, context_and_fn_to_fact_map, post_facts, arg_ops, dest)
+        let callee_did = crate_info.get_fn_def_id(fn_op);
+        let fn_ty = crate_info.get_fn_ty(&caller_did, fn_op);
+        Self::fn_call_mir_ids(caller_did, callee_did, fn_ty, crate_info, context_and_fn_to_fact_map, post_facts, arg_ops, dest)
     }
 
     fn extract_global_facts<'a, 'mir, 'gcx: 'tcx, 'tcx: 'mir + 'a>(
@@ -264,6 +265,7 @@ fn get_arg_paths<'mir,'tcx>(raw_au: &RawAnalysisUnit<CriticalPaths<BaseVar>>,
                             crate_info: &CrateInfo<'mir,'tcx>,
                             context_and_fn_to_fact_map: &CrateFactsMap<CriticalPaths<BaseVar>>
     ) -> Vec<(Lvalue<'tcx>,CriticalPaths<BaseVar>)> {
+    errln!("    Lookup: {:?}", raw_au);
     let au = (raw_au.0.clone(), Context::Internal(raw_au.1.clone()));
     let empty = CriticalPaths::empty();
     let start_facts = context_and_fn_to_fact_map.get(&au)
@@ -282,51 +284,54 @@ fn get_arg_paths<'mir,'tcx>(raw_au: &RawAnalysisUnit<CriticalPaths<BaseVar>>,
 impl<'mir,'tcx> AnalysisState<'mir,'tcx,CriticalPaths<BaseVar>,CriticalPaths<DefId>> {
 
     /// Produces a list of (Span, Error Message) pairs.
-    pub fn get_lints(&self,
-                     analysis: &ty::CrateAnalysis,
-                     hir: &hir::Crate)
-                     -> Vec<(Span,String)> {
+    pub fn get_lints<'ast>(&self,
+                           hir: &hir::Crate)
+                           -> Vec<(Span,String)> {
         // Get a list of ids for the unsafe functions (TODO there's got to be a better way)
         let unsafe_fn_ids = get_unsafe_fn_ids(hir);
         // Look through all safe exports
-        analysis.access_levels.map.iter().filter(|&(id, _)|
+        self.info.analysis.access_levels.map.iter().filter(|&(id, _)|
             !unsafe_fn_ids.contains(id)
         ).filter_map(|(fn_nid, _)| {
-            self.info.node_id_to_mir(fn_nid).and_then(|mir| {
-                let mir_info = self.info.get_mir_info(&fn_nid);
-                let start_facts: &CriticalPaths<BaseVar> = self.context_and_fn_to_fact_map
-                    .get(&(*fn_nid, Context::User))
-                    .unwrap().get(&START_STMT).unwrap();
-                let concerning_paths: Vec<_> = start_facts.iter().filter_map(|(path, _)| {
-                    if path.of_argument() && mir_info.is_path_exported(path.as_ref()) {
-                        let path_string = format!("{:?}", path);
-                        Some(
-                            mir_info.get_ast_name(path.base()).map(|name| {
-                                let ugly_name = format!("{:?}", path.base());
-                                // TODO: report criticalness
-                                let pretty_name = format!("{}", name);
-                                path_string.replace(&ugly_name, &pretty_name)
-                            }).unwrap_or(path_string)
-                        )
-                    } else { None }
-                }).collect();
-                if concerning_paths.len() == 0 {
-                    None
-                } else {
-                    let fn_did = self.info.tcx.map.local_def_id(*fn_nid);
-                    let fn_name = self.info.tcx.item_path_str(fn_did);
-                    let arguments: Vec<_>= concerning_paths.iter().map(|name|
-                        format!("`{}`", name)
-                    ).collect();
-                    let fmt_args = if arguments.len() > 1 {
-                        format!("arguments {}", arguments.join(", "))
+            if let Some(fn_did) = self.info.tcx.map.opt_local_def_id(*fn_nid) {
+                self.info.did_to_mir(&fn_did).and_then(|mir| {
+                    let mir_info = self.info.get_mir_info(&fn_did);
+                    let start_facts: &CriticalPaths<BaseVar> = self.context_and_fn_to_fact_map
+                        .get(&(fn_did, Context::User))
+                        .unwrap().get(&START_STMT).unwrap();
+                    let concerning_paths: Vec<_> = start_facts.iter().filter_map(|(path, _)| {
+                        if path.of_argument() && mir_info.is_path_exported(path.as_ref()) {
+                            let path_string = format!("{:?}", path);
+                            Some(
+                                mir_info.get_ast_name(path.base()).map(|name| {
+                                    let ugly_name = format!("{:?}", path.base());
+                                    // TODO: report criticalness
+                                    let pretty_name = format!("{}", name);
+                                    path_string.replace(&ugly_name, &pretty_name)
+                                }).unwrap_or(path_string)
+                            )
+                        } else { None }
+                    }).collect();
+                    if concerning_paths.len() == 0 {
+                        None
                     } else {
-                        format!("argument {}", arguments[0])
-                    };
-                    let err_msg = format!("The publically visible function `{}` has critical {}. By inputting certain arguments a user of this function might cause an invalid raw pointer to be dereferenced", fn_name, fmt_args);
-                    Some( (mir.span.clone(), err_msg) )
-                }
-            })
+                        let fn_name = self.info.tcx.item_path_str(fn_did);
+                        let arguments: Vec<_>= concerning_paths.iter().map(|name|
+                            format!("`{}`", name)
+                        ).collect();
+                        let fmt_args = if arguments.len() > 1 {
+                            format!("arguments {}", arguments.join(", "))
+                        } else {
+                            format!("argument {}", arguments[0])
+                        };
+                        let err_msg = format!("The publically visible function `{}` has critical {}. By inputting certain arguments a user of this function might cause an invalid raw pointer to be dereferenced", fn_name, fmt_args);
+                        Some( (mir.span.clone(), err_msg) )
+                    }
+                })
+            }
+            else {
+                None
+            }
         }).collect()
     }
 }

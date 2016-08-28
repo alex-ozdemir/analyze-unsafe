@@ -11,11 +11,8 @@ extern crate syntax_pos;
 extern crate serialize;
 extern crate rustc_data_structures;
 
-mod dataflow;
 mod count;
-mod back;
 mod backflow;
-mod simple;
 mod complex;
 mod base_var;
 mod dep_graph;
@@ -35,6 +32,8 @@ use rustc::session::{config,Session};
 
 use rustc_driver::{driver,CompilerCalls,RustcDefaultCalls,Compilation};
 use rustc_driver::driver::CompileState;
+
+use syntax::ast;
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
@@ -103,16 +102,17 @@ impl<'a> AnalyzeUnsafe<'a> {
     pub fn dataflow() -> AnalyzeUnsafe<'a> {
         AnalyzeUnsafe::new(Box::new(move |state| {
             let analysis = state.analysis.unwrap();
+            //let hir_map = state.ast_map.unwrap();
             let hir = state.hir_crate.unwrap();
             let tcx = state.tcx.expect("Type context should exist");
             let mir_map = state.mir_map.expect("We should be in orbit - use `-Z orbit`");
-            errln!("Spinning up analysis. Mir count: {}", mir_map.map.len());
-            let escape_analysis = ComplexEscapeAnalysis::flow(mir_map, tcx, analysis.access_levels.clone());
+            errln!("Spinning up analysis. Mir count: {}", mir_map.map.keys().len());
+            let escape_analysis = ComplexEscapeAnalysis::flow(mir_map, tcx, analysis.clone());
             for (au, map) in escape_analysis.context_and_fn_to_fact_map.iter() {
                 errln!("{:?} ", au);
                 print_map_lines(map);
             }
-            escape_analysis.get_lints(analysis, hir).iter().map(|&(span, ref err)|
+            escape_analysis.get_lints(/* hir_map, */hir).iter().map(|&(span, ref err)|
                 state.session.span_warn(span, err)
             ).count();
         }))
@@ -123,25 +123,28 @@ impl<'a,'callback: 'a> CompilerCalls<'a> for AnalyzeUnsafe<'callback> {
     fn early_callback(&mut self,
                       matches: &getopts::Matches,
                       sopts: &config::Options,
+                      cfg: &ast::CrateConfig,
                       descriptions: &rustc_errors::registry::Registry,
                       output: config::ErrorOutputType)
                       -> Compilation {
-        self.default.early_callback(matches, sopts, descriptions, output)
+        self.default.early_callback(matches, sopts, cfg, descriptions, output)
     }
 
     fn no_input(&mut self,
                 matches: &getopts::Matches,
                 sopts: &config::Options,
+                cfg: &ast::CrateConfig,
                 odir: &Option<PathBuf>,
                 ofile: &Option<PathBuf>,
                 descriptions: &rustc_errors::registry::Registry)
                 -> Option<(config::Input, Option<PathBuf>)> {
-        self.default.no_input(matches, sopts, odir, ofile, descriptions)
+        self.default.no_input(matches, sopts, cfg, odir, ofile, descriptions)
     }
 
     fn late_callback(&mut self,
                      matches: &getopts::Matches,
                      sess: &Session,
+                     cfg: &ast::CrateConfig,
                      input: &config::Input,
                      odir: &Option<PathBuf>,
                      ofile: &Option<PathBuf>)
@@ -153,7 +156,7 @@ impl<'a,'callback: 'a> CompilerCalls<'a> for AnalyzeUnsafe<'callback> {
                 }
             }
         }
-        self.default.late_callback(matches, sess, input, odir, ofile)
+        self.default.late_callback(matches, sess, cfg, input, odir, ofile)
     }
 
     fn build_controller(
@@ -168,7 +171,7 @@ impl<'a,'callback: 'a> CompilerCalls<'a> for AnalyzeUnsafe<'callback> {
         let do_analysis = self.do_analysis;
         control.after_analysis.callback = Box::new(move |state| {
             state.session.abort_if_errors();
-            if do_analysis {
+            if true {
                 (*callback)(state);
                 original_after_analysis_callback(state);
             }

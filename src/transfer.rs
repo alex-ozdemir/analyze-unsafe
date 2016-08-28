@@ -204,9 +204,9 @@ pub fn difference<Base: Clone + Debug + Ord>(
 }
 
 pub fn gen_by_statement<'a, 'mir, 'gcx, 'tcx>(info: MIRInfo<'a, 'mir, 'gcx, 'tcx>,
-                                              statement: &StatementKind<'tcx>)
+                                              lvalue: &Lvalue<'tcx>,
+                                              rvalue: &Rvalue<'tcx>)
                                               -> CriticalPaths<BaseVar> {
-    let StatementKind::Assign(ref lvalue, ref rvalue) = *statement;
     join(&gen_by_lvalue(info, lvalue), &gen_by_rvalue(info, rvalue))
 }
 pub fn gen_by_operand<'a, 'mir, 'gcx, 'tcx>(info: MIRInfo<'a, 'mir, 'gcx, 'tcx>,
@@ -276,9 +276,9 @@ pub fn gen_by_rvalue<'a, 'mir, 'gcx, 'tcx>(info: MIRInfo<'a, 'mir, 'gcx, 'tcx>,
 
 #[allow(unused_variables)]
 pub fn kill<'a, 'mir, 'gcx, 'tcx>(info: MIRInfo<'a, 'mir, 'gcx, 'tcx>,
-                                  statement: &StatementKind<'tcx>)
+                                  lvalue: &Lvalue,
+                                  rvalue: &Rvalue)
                                   -> BTreeSet<Path<BaseVar>> {
-    let StatementKind::Assign(ref lvalue, ref rvalue) = *statement;
     BTreeSet::new()
 }
 
@@ -443,14 +443,14 @@ fn reduce_and_secure(p: TmpPath<BaseVar>, u: CriticalUse) -> Option<(Path<BaseVa
 }
 
 pub fn flow<'a, 'mir, 'gcx, 'tcx>(info: MIRInfo<'a, 'mir, 'gcx, 'tcx>,
-                                  statement: &StatementKind<'tcx>,
+                                  lvalue: &Lvalue<'tcx>,
+                                  rvalue: &Rvalue<'tcx>,
                                   post_facts: &CriticalPaths<BaseVar>)
                                   -> CriticalPaths<BaseVar> {
     use rustc::mir::repr::Rvalue::*;
     use rustc::mir::repr::Operand::*;
     use rustc::mir::repr::AggregateKind::{Tuple, Adt, Closure, Vec as VecAgg};
-    let StatementKind::Assign(ref l1, ref rvalue) = *statement;
-    let p1 = &lvalue_path(l1);
+    let p1 = &lvalue_path(lvalue);
     match rvalue {
         &Use(ref op) => flow_assign_lval_operand(info, p1, op, post_facts),
         &Repeat(ref op, _) => flow_assign_lval_operand(info, p1, op, post_facts),
@@ -510,8 +510,13 @@ pub fn transfer<'a, 'mir, 'gcx, 'tcx>(info: MIRInfo<'a, 'mir, 'gcx, 'tcx>,
                                       statement: &StatementKind<'tcx>,
                                       post_facts: &CriticalPaths<BaseVar>)
                                       -> CriticalPaths<BaseVar> {
-    let gen = &gen_by_statement(info, statement);
-    let kill = &kill(info, statement);
-    let flow = &flow(info, statement, post_facts);
-    join(&difference(&join(post_facts, flow), kill), gen)
+    match statement {
+        &StatementKind::Assign(ref lvalue, ref rvalue) => {
+            let gen = &gen_by_statement(info, lvalue, rvalue);
+            let kill = &kill(info, lvalue, rvalue);
+            let flow = &flow(info, lvalue, rvalue, post_facts);
+            join(&difference(&join(post_facts, flow), kill), gen)
+        },
+        _ => post_facts.clone(),
+    }
 }

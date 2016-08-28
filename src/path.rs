@@ -402,7 +402,8 @@ pub fn paths_to_field_acc<'tcx:'mir,'mir,Base: Clone + Eq + Debug>(
             }
             paths
         }
-        TyClosure(_, _) | TyProjection(_) | TyTrait(_) | TyFnDef(_, _, _) | TyFnPtr(_) => vec![],
+        TyClosure(_, _) | TyProjection(_) | TyTrait(_) | TyFnDef(_, _, _) | TyFnPtr(_) | TyNever |
+            TyAnon(_, _) => vec![],
     }
 }
 

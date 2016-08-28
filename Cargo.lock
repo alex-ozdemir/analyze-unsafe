@@ -3,7 +3,7 @@ name = "analyze-unsafe"
 version = "0.1.0"
 dependencies = [
  "cargo 0.9.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "compiletest_rs 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "compiletest_rs 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "glob 0.2.11 (registry+https://github.com/rust-lang/crates.io-index)",
  "lazy_static 0.1.16 (registry+https://github.com/rust-lang/crates.io-index)",
  "libc 0.2.11 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -74,7 +74,7 @@ dependencies = [
 
 [[package]]
 name = "compiletest_rs"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 dependencies = [
  "log 0.3.6 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -509,7 +509,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 "checksum bitflags 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)" = "2a6577517ecd0ee0934f48a7295a89aaef3e6dfafeac404f94c0b3448518ddfe"
 "checksum cargo 0.9.0 (registry+https://github.com/rust-lang/crates.io-index)" = "ba6c436f69afd7689aa8bf3c9ea989d76d54b60c4000234a8b2d6c781a3c3031"
 "checksum cmake 0.1.17 (registry+https://github.com/rust-lang/crates.io-index)" = "dfcf5bcece56ef953b8ea042509e9dcbdfe97820b7e20d86beb53df30ed94978"
-"checksum compiletest_rs 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)" = "1a1128178f1b89c27a89c24bc58dd7ab707d14477861b6bdf74fbd8563c859e3"
+"checksum compiletest_rs 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)" = "0bcddebf582c5c035cce855a89596eb686cc40b9e77da1026fba735dcca2fbd3"
 "checksum crates-io 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)" = "f51f63b1ea3fc42edcb62b66b33401288d62067ec7d9ddd9838ea70b00fa83d2"
 "checksum crossbeam 0.2.9 (registry+https://github.com/rust-lang/crates.io-index)" = "fb974f835e90390c5f9dfac00f05b06dc117299f5ea4e85fbc7bb443af4911cc"
 "checksum curl 0.2.19 (registry+https://github.com/rust-lang/crates.io-index)" = "48121fcaa9dc3564dea237c5b473967c682dcc1a5910312d7b9fc54fd5bcc188"
